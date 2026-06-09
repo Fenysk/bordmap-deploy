@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bordmap — TEST stack for the shared NAS (FEN-529). Same isolation pattern as
+# LivePlace test (FEN-523).
+#
+# Run from the REPO ROOT (the nas-deploy script does this for you):
+#   docker compose -p bordmap-test \
+#     -f deploy/nas/bordmap-test/docker-compose.test.yml \
+#     --env-file .env up -d --build
+#
+# WHY STANDALONE (not a `-f base -f override` overlay like LivePlace):
+#   Bordmap's root docker-compose.yml *publishes* 3000/3210/3211 on 0.0.0.0.
+#   A Compose override MERGES (appends) port lists — it cannot remove the base
+#   0.0.0.0 publishes — so an overlay would leave the stack wide-open on the LAN
+#   and racing the host ports on a shared NAS. A self-contained file gives a
+#   deterministic loopback-only bind with zero merge surprises. The build context
+#   (`../../..`) resolves to the repo root, so the SAME image as prod is built.
+#
+# Isolation contract (NAS is shared: LivePlace :8090 / :8091, receipt-scanner,
+# dns-router-caddy, supabase×13, …):
+#   * Project name `bordmap-test` prefixes the container, the default network and
+#     the `convex-data` named volume (-> bordmap-test_convex-data). Zero collision
+#     with prod (bordmap.fenysk.fr stays on the Coolify VPS, untouched).
+#   * Host ports are LOOPBACK-ONLY and OFF the 8090/8091 block used by LivePlace:
+#       8092 -> app (:3000)   8093 -> Convex API (:3210)   8094 -> Convex site (:3211)
+#     Front with Tailscale Serve (HTTPS) or bind BIND=<tailscale-ip> for a
+#     tailnet-only HTTP interim. NEVER 0.0.0.0 (that would expose on the LAN).
+services:
+  bordmap:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      args:
+        # PUBLIC origin the browser uses to reach Convex — BAKED at build time.
+        # Tailscale Serve (HTTPS):   https://<magicdns>/convex
+        # tailnet HTTP interim:      http://<tailscale-ip>:8093
+        VITE_CONVEX_URL: ${VITE_CONVEX_URL:-http://localhost:8093}
+        CONVEX_BACKEND_IMAGE: ${CONVEX_BACKEND_IMAGE:-ghcr.io/get-convex/convex-backend:aeb5f28adfe92f88c8c504b7883a12acfdf7cde6}
+    ports:
+      # BIND defaults to loopback (safe). Set BIND=<tailscale-ip> for tailnet HTTP.
+      - "${BIND:-127.0.0.1}:${APP_PORT:-8092}:3000"     # Start app
+      - "${BIND:-127.0.0.1}:${CONVEX_API_PORT:-8093}:3210"  # Convex API origin
+      - "${BIND:-127.0.0.1}:${CONVEX_SITE_PORT:-8094}:3211" # Convex HTTP/site origin
+    environment:
+      CONVEX_SELF_HOSTED_ADMIN_KEY: ${CONVEX_SELF_HOSTED_ADMIN_KEY:-}
+      # PUBLIC origins the browser/CLI use to reach Convex (behind the NAS front).
+      CONVEX_CLOUD_ORIGIN: ${CONVEX_CLOUD_ORIGIN:-}
+      CONVEX_SITE_ORIGIN: ${CONVEX_SITE_ORIGIN:-}
+      DISABLE_BEACON: ${DISABLE_BEACON:-true}
+      # --- Better Auth (L1) ---
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-changeme-set-BETTER_AUTH_SECRET}
+      SITE_URL: ${SITE_URL:-http://localhost:8092}
+      AUTH_ISSUER: ${AUTH_ISSUER:-}
+      # --- R2 routing (GraphHopper, FEN-507) — blank = routing disabled (no-op). ---
+      GRAPHHOPPER_URL: ${GRAPHHOPPER_URL:-}
+    volumes:
+      - convex-data:/convex/data
+    restart: unless-stopped
+    # Bounded resource envelope on a shared NAS (single image runs Convex backend
+    # + Start app in one container → give it room but cap blast radius).
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
+volumes:
+  convex-data:
