@@ -40,7 +40,10 @@ services:
         # binary which requires GLIBC 2.38/2.39. The NAS host has GLIBC 2.39
         # (Ubuntu) but the Docker container runs in the image's own glibc, not
         # the host's. Noble matches the host ABI and unblocks the convex backend.
-        NODE_IMAGE: ${NODE_IMAGE:-node:24-noble-slim}
+        # node:24-trixie-slim = Debian 13 (trixie), GLIBC 2.40 — satisfies
+        # the convex binary's GLIBC 2.38/2.39 requirement without modifying the
+        # shared Dockerfile. bookworm-slim (GLIBC 2.36) is too old.
+        NODE_IMAGE: ${NODE_IMAGE:-node:24-trixie-slim}
     ports:
       # BIND defaults to loopback (safe). Set BIND=<tailscale-ip> for tailnet HTTP.
       - "${BIND:-127.0.0.1}:${APP_PORT:-8092}:3000"     # Start app
