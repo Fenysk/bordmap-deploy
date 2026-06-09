@@ -47,10 +47,11 @@ paperclip@NAS private key injected to reach the NAS (project secret — ensure t
 issue carries the right projectId so the env is populated)."
   KEYFILE="$(mktemp)"; chmod 600 "$KEYFILE"
   trap 'rm -f "$KEYFILE"' EXIT
-  if printf '%s' "$NAS_SSH_KEY" | grep -q $'\n'; then
-    printf '%s\n' "$NAS_SSH_KEY" > "$KEYFILE"
-  else
-    python3 - "$KEYFILE" <<'PY'
+  # Always run through python3 normalizer — handles all variations:
+  # pure single-line (spaces), mixed (some \n + some spaces), pure multi-line.
+  # Simply stripping all whitespace from the base64 body and re-wrapping is
+  # safe for any PEM regardless of the original line-break style.
+  python3 - "$KEYFILE" <<'PY'
 import os, re, sys
 raw = os.environ["NAS_SSH_KEY"].strip()
 m = re.match(r"(-----BEGIN [A-Z0-9 ]+-----)\s+(.*?)\s+(-----END [A-Z0-9 ]+-----)\s*$", raw, re.S)
@@ -61,7 +62,6 @@ body = re.sub(r"\s+", "", body)
 wrapped = "\n".join(body[i:i+64] for i in range(0, len(body), 64))
 open(sys.argv[1], "w").write(f"{header}\n{wrapped}\n{footer}\n")
 PY
-  fi
   ssh-keygen -y -f "$KEYFILE" >/dev/null 2>&1 || die "Reconstructed key is invalid PEM"
   log "PEM reconstructed and validated."
 }
