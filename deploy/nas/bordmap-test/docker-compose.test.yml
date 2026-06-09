@@ -35,6 +35,12 @@ services:
         # tailnet HTTP interim:      http://<tailscale-ip>:8093
         VITE_CONVEX_URL: ${VITE_CONVEX_URL:-http://localhost:8093}
         CONVEX_BACKEND_IMAGE: ${CONVEX_BACKEND_IMAGE:-ghcr.io/get-convex/convex-backend:aeb5f28adfe92f88c8c504b7883a12acfdf7cde6}
+        # Override base to Ubuntu Noble (GLIBC 2.39) for the NAS test.
+        # The default bookworm base (GLIBC 2.36) is too old for the convex
+        # binary which requires GLIBC 2.38/2.39. The NAS host has GLIBC 2.39
+        # (Ubuntu) but the Docker container runs in the image's own glibc, not
+        # the host's. Noble matches the host ABI and unblocks the convex backend.
+        NODE_IMAGE: ${NODE_IMAGE:-node:24-noble-slim}
     ports:
       # BIND defaults to loopback (safe). Set BIND=<tailscale-ip> for tailnet HTTP.
       - "${BIND:-127.0.0.1}:${APP_PORT:-8092}:3000"     # Start app

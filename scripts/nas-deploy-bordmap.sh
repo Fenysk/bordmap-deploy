@@ -84,12 +84,12 @@ COMPOSE=(docker compose -p "$PROJECT" \
 
 sync_repo() {
   ssh_nas "mkdir -p '$NAS_DIR'"
-  log "rsync repo -> ${NAS_USER}@${ACTIVE_HOST}:${NAS_DIR}"
-  rsync -az --delete \
-    --exclude '.git' --exclude 'node_modules' --exclude 'dist' \
-    --exclude '.env' --exclude '*.local' \
-    -e "ssh -i '$KEYFILE' -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
-    "$REPO_ROOT/" "${NAS_USER}@${ACTIVE_HOST}:${NAS_DIR}/"
+  log "git archive | ssh tar -> ${NAS_USER}@${ACTIVE_HOST}:${NAS_DIR}"
+  # rsync may be absent from the sandbox PATH (only the NAS has it). Use
+  # git archive to stream the working-tree via tar over SSH instead.
+  git -C "$REPO_ROOT" archive --format=tar HEAD \
+    | ssh -i "$KEYFILE" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      "${NAS_USER}@${ACTIVE_HOST}" "tar -xf - -C '$NAS_DIR'"
   # The stack .env is provisioned out-of-band on the NAS (secrets, never in repo).
   ssh_nas "test -f '$NAS_DIR/.env'" \
     || die "No $NAS_DIR/.env on the NAS. Copy deploy/nas/bordmap-test/.env.test.example -> .env (chmod 600), fill secrets."
