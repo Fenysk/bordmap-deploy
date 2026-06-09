@@ -1,0 +1,7 @@
+# Bordmap Coolify reverse proxy — bakes the Caddyfile into the image (FEN-437).
+# Build context = repo root (so infra/coolify/Caddyfile resolves); referenced by
+# docker-compose.coolify.yml's `proxy` service. Multi-arch (caddy publishes
+# amd64+arm64), so this is fine on the Synology NAS too.
+FROM caddy:2-alpine
+COPY infra/coolify/Caddyfile /etc/caddy/Caddyfile
+EXPOSE 80

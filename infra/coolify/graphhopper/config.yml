@@ -1,0 +1,90 @@
+# GraphHopper engine config for Bordmap R2 routing (FEN-507).
+# Implements the service-facing contract in docs/adr/0002-r2-routing-engine.md.
+#
+# Pinned to the graphhopper/graphhopper:8.0 config schema (see Dockerfile). v8 is
+# chosen deliberately for reproducibility: it still supports the `vehicle: roads`
+# base in a profile + an inline custom_model, which is the simplest, best-
+# documented form. v9+ removed `vehicle:` (profiles became custom-model-only on
+# encoded values) — bumping the image REQUIRES migrating this profile block. The
+# graph IMPORT on first deploy is the verification gate (see README).
+#
+# All mutable data lives under /data (the persistent Coolify volume): the OSM
+# extract, the built graph cache, and the SRTM elevation cache. config.yml +
+# custom model are BAKED into the image (never bind-mounted — Coolify/OCI bind-
+# mount-file bug, same reason the app's Caddyfile is baked).
+graphhopper:
+  # OSM extract — France only (board pilot region). import-and-serve.sh downloads
+  # france-latest.osm.pbf from Geofabrik to /data if absent, so this path persists.
+  datareader.file: /data/france-latest.osm.pbf
+
+  # Built graph cache — persisted on the volume to skip re-import on restart.
+  graph.location: /data/graph-cache
+
+  # MMAP caps import RAM (the graph is memory-mapped from disk, not heap-resident).
+  # Required to fit the France import under the NAS memory budget (ADR §Infra:
+  # import ~6-8 GB with RAM_STORE → MMAP keeps the JVM heap small). Trades some
+  # query latency for a much smaller footprint — acceptable for Bordmap's volume.
+  graph.dataaccess.default_type: MMAP
+
+  # Native elevation (ascend/descend) via SRTM ~30 m (board Q3 accepts "approximatif").
+  # Cached on the volume so it is downloaded once. If the SRTM source is
+  # unreachable the graph still builds and elevation degrades to null per contract.
+  graph.elevation.provider: srtm
+  graph.elevation.cache_dir: /data/srtm
+  # MMAP the elevation cache too (large rasters, read-mostly).
+  graph.elevation.dataaccess: MMAP
+
+  # Encoded values the bordmap_road custom model references (road_class /
+  # road_access / surface) plus average_slope so the response carries grade.
+  graph.encoded_values: road_class, road_access, road_environment, surface, average_slope, max_speed
+
+  # One profile, `bordmap_road`. Base vehicle `roads` is direction-agnostic
+  # (ignores oneway/access) so a descente can be referenced in either travel
+  # sense (ADR D-R2). The inline custom_model is the contract from the ADR:
+  # prefer paved, exclude motorway/trunk and private/no access.
+  profiles:
+    - name: bordmap_road
+      vehicle: roads
+      custom_model:
+        priority:
+          - if: "road_class == MOTORWAY || road_class == TRUNK"
+            multiply_by: "0"
+          - if: "road_access == PRIVATE || road_access == NO"
+            multiply_by: "0"
+          - if: "surface == PAVED || surface == ASPHALT || surface == CONCRETE"
+            multiply_by: "1.0"
+          - else: ""
+            multiply_by: "0.5" # unpaved/unknown allowed but de-prioritised
+
+  # Landmarks (LM) preparation enables the `alternative_route` algorithm (up to 3
+  # paths, D→A) WITHOUT Contraction Hierarchies. CH is intentionally NOT enabled:
+  # it precludes the flexible alternative_route + runtime custom-model behaviour
+  # the contract relies on. LM build is cheaper and persisted in the graph cache.
+  profiles_lm:
+    - profile: bordmap_road
+
+  # No CH (see above).
+  profiles_ch: []
+
+# Dropwizard server — bind 0.0.0.0 so sibling Coolify containers (the Convex
+# backend running the computeRoutes action) reach it on the internal network.
+# This service is NEVER assigned a public domain (see docker-compose.graphhopper.yml).
+server:
+  application_connectors:
+    - type: http
+      port: 8989
+      bind_host: 0.0.0.0
+  admin_connectors:
+    - type: http
+      port: 8990
+      bind_host: 0.0.0.0
+  request_log:
+    appenders: []
+
+# Keep logs on stderr/stdout for Coolify log capture.
+logging:
+  appenders:
+    - type: console
+      time_zone: UTC
+      log_format: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{15} - %msg%n"
+  level: INFO

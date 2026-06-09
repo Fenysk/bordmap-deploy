@@ -1,0 +1,14 @@
+node_modules
+.output
+.nitro
+.tanstack
+dist
+coverage
+.git
+.github
+*.log
+.env
+.env.local
+.env.*.local
+README.md
+docs
