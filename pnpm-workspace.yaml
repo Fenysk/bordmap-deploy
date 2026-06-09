@@ -1,0 +1,7 @@
+# pnpm 11 build-script allowlist. esbuild/lightningcss/unrs-resolver ship
+# prebuilt native binaries; allow their install scripts to run.
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  lightningcss: true
+  unrs-resolver: true
