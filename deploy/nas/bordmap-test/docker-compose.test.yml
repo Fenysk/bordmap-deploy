@@ -45,10 +45,12 @@ services:
         # shared Dockerfile. bookworm-slim (GLIBC 2.36) is too old.
         NODE_IMAGE: ${NODE_IMAGE:-node:24-trixie-slim}
     ports:
-      # BIND defaults to loopback (safe). Set BIND=<tailscale-ip> for tailnet HTTP.
-      - "${BIND:-127.0.0.1}:${APP_PORT:-8092}:3000"     # Start app
-      - "${BIND:-127.0.0.1}:${CONVEX_API_PORT:-8093}:3210"  # Convex API origin
-      - "${BIND:-127.0.0.1}:${CONVEX_SITE_PORT:-8094}:3211" # Convex HTTP/site origin
+      # APP_BIND defaults to loopback (safe). Set APP_BIND=0.0.0.0 (or a tailscale-ip)
+      # to expose ONLY the app on LAN/tailnet (FEN-530). Convex API/site (8093/8094)
+      # stay loopback via BACKEND_BIND — never expose the backend.
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8092}:3000"     # Start app (FEN-530: set APP_BIND=0.0.0.0 to expose on LAN/tailnet)
+      - "${BACKEND_BIND:-127.0.0.1}:${CONVEX_API_PORT:-8093}:3210"  # Convex API origin (LOOPBACK-ONLY — never expose)
+      - "${BACKEND_BIND:-127.0.0.1}:${CONVEX_SITE_PORT:-8094}:3211" # Convex HTTP/site origin (LOOPBACK-ONLY — never expose)
     environment:
       CONVEX_SELF_HOSTED_ADMIN_KEY: ${CONVEX_SELF_HOSTED_ADMIN_KEY:-}
       # PUBLIC origins the browser/CLI use to reach Convex (behind the NAS front).
