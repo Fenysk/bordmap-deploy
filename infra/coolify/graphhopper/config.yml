@@ -13,9 +13,12 @@
 # custom model are BAKED into the image (never bind-mounted — Coolify/OCI bind-
 # mount-file bug, same reason the app's Caddyfile is baked).
 graphhopper:
-  # OSM extract — France only (board pilot region). import-and-serve.sh downloads
-  # france-latest.osm.pbf from Geofabrik to /data if absent, so this path persists.
-  datareader.file: /data/france-latest.osm.pbf
+  # OSM extract — Rhône-Alpes regional extract (board pilot region; FEN-599 reduced
+  # the scope from all-of-France because the France graph OOM'd the NAS, see the
+  # docker-compose cgroup/MMAP note). import-and-serve.sh downloads the region set
+  # by GH_OSM_URL to this STABLE, region-agnostic path if absent — so switching
+  # regions never desyncs this config (wipe the volume on a switch; README).
+  datareader.file: /data/region-latest.osm.pbf
 
   # Built graph cache — persisted on the volume to skip re-import on restart.
   graph.location: /data/graph-cache

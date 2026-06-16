@@ -30,26 +30,38 @@ services:
       # headroom under the cgroup limit for mmap page cache + GC.
       # import-and-serve.sh reads JAVA_OPTS.
       # 1g max / 256m initial: MMAP is off-heap so the JVM only needs heap for the
-      # routing algorithm's working set (priority queues, A*). 2g was too large —
-      # JVM+overhead consumed ~2.5g, leaving only ~1.5g for kernel MMAP page cache
-      # on a 4g container → OOM after 15-45 min (FEN-519). Lower to 1g so the
-      # kernel has ~2.5g for MMAP. For the one-time first import set
-      # GH_JAVA_OPTS=-Xmx2g in the Coolify env and restore after (see README).
+      # routing algorithm's working set (priority queues, A*). For the regional
+      # Rhône-Alpes extract (see GH_OSM_URL below) the graph is small (~0.5 GB),
+      # so 1g heap is generous and the one-time import fits without a temp bump.
       JAVA_OPTS: ${GH_JAVA_OPTS:--Xmx1g -Xms256m}
-      # Override the OSM source/region here without rebuilding the image if needed.
-      GH_OSM_URL: ${GH_OSM_URL:-https://download.geofabrik.de/europe/france-latest.osm.pbf}
+      # OSM source/region. DEFAULT = Rhône-Alpes regional extract (FEN-599), NOT
+      # all of France. WHY: the France extract (~4.5 GB PBF → ~3-5 GB MMAP'd graph)
+      # does not fit a NAS-reasonable cgroup. Critically, MMAP page cache is charged
+      # to the container's memory cgroup, so `mem_limit` must hold heap (~1.5 GB)
+      # PLUS the entire resident graph — the France graph drives the cgroup past 5 GB
+      # under load and the kernel OOM-kills the JVM. FEN-519 raised the limit 4→5 GB
+      # but the France footprint still rechute-OOM'd (FEN-599). Rhône-Alpes (the
+      # board pilot region, action pre-approved on FEN-599) shrinks the PBF to
+      # ~430 MB and the graph to ~0.5 GB → fits comfortably with headroom to spare.
+      # The healthcheck route below (Grenoble) is inside Rhône-Alpes, so coverage of
+      # the pilot is preserved. To serve a different region (or all of France on a
+      # box with the RAM/disk for it), override GH_OSM_URL in the Coolify env AND
+      # wipe the volume so the old graph cache re-imports (see README §Region switch).
+      GH_OSM_URL: ${GH_OSM_URL:-https://download.geofabrik.de/europe/france/rhone-alpes-latest.osm.pbf}
     volumes:
-      # Persistent: OSM extract (~4.5 GB) + built graph cache (~3-5 GB) + SRTM
-      # cache (~1-2 GB). Host must provide >= 20 GB free on this volume's disk
-      # (ADR §Infra). Named volume → survives redeploys, so the heavy import runs
-      # ONCE and restarts serve from cache.
+      # Persistent: OSM extract (~430 MB Rhône-Alpes) + built graph cache (~0.5 GB) +
+      # SRTM cache (~0.3-0.5 GB). A few GB free on this volume's disk suffices for the
+      # regional extract (the ≥20 GB ADR figure was the France estimate). Named
+      # volume → survives redeploys, so the import runs ONCE and restarts serve cache.
       - graphhopper-data:/data
-    # RUNTIME memory cap. JVM heap = 1g + ~0.5g JVM overhead + MMAP page cache for
-    # the France graph (up to ~3-4g of kernel pages). 5g gives the kernel enough
-    # room to hold hot graph segments without OOM-killing the JVM (FEN-519: the old
-    # 4g limit was too tight — heap+overhead left only ~1.5g for MMAP). If the NAS
-    # cannot spare 5g, lower to 4g AND set GH_JAVA_OPTS=-Xmx768m in Coolify env.
-    mem_limit: 5g
+    # RUNTIME memory cap. cgroup must hold JVM heap (1g) + ~0.5g JVM overhead + the
+    # MMAP page cache for the resident graph (page cache IS charged to the cgroup).
+    # For Rhône-Alpes the hot graph is ~0.5 GB, so 2g leaves comfortable headroom and
+    # frees ~3 GB of NAS RAM vs the old France-sized 5g limit (FEN-599: smaller blast
+    # radius, better NAS neighbour). For a larger region, raise this so heap + the
+    # full resident graph fit (France needed >5g and still wasn't reliable — that is
+    # exactly what FEN-599 moved away from).
+    mem_limit: 2g
     healthcheck:
       # AC-as-healthcheck (FEN-507 completeness criterion). This service is
       # internal-only (no public domain) and this Coolify version (4.1.2) exposes
@@ -62,15 +74,19 @@ services:
       # certifies the AC end-to-end. It is also a strictly better production
       # readiness probe than a bare /health ping. Elevation is baked at import time,
       # so this query is deterministic with no runtime network dependency.
-      # During the one-time France import the server is not yet bound, so
-      # start_period stays generous. curl + grep are in the image.
+      # During the one-time regional import the server is not yet bound, so
+      # start_period covers it. The Rhône-Alpes import + SRTM download finishes in
+      # well under 30 min (vs ~60-90 min for France), so 1800s is generous enough to
+      # avoid false unhealthy during import while still detecting a genuinely stuck
+      # container ~3x faster than the old France-sized 5400s (FEN-599).
+      # curl + grep are in the image.
       test:
         - CMD-SHELL
         - 'curl -fsS "http://127.0.0.1:8989/route?point=45.188,5.724&point=45.196,5.735&profile=bordmap_road&elevation=true&points_encoded=false&instructions=false" | grep -q ascend'
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 5400s
+      start_period: 1800s
     restart: unless-stopped
     networks:
       - coolify
