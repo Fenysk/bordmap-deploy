@@ -1,0 +1,40 @@
+# Bordmap reverse proxy for the Coolify deploy (FEN-437, owned by DevOps).
+#
+# Bordmap ships as a SINGLE image (app on :3000 + self-hosted Convex on :3210,
+# see ../../Dockerfile). The browser needs BOTH origins on ONE public domain, so
+# this tiny Caddy sits in front of the bordmap container and path-routes:
+#
+#   /convex*   -> Convex CLOUD origin (:3210)  — the Convex client API/sync.
+#                 VITE_CONVEX_URL = https://<host>/convex ; handle_path strips the
+#                 /convex prefix so the backend (served at root) sees bare paths.
+#                 The token-free smoke hits https://<host>/convex/version -> /version.
+#   everything -> the Start (Nitro) app (:3000) — the SPA AND Better Auth
+#                 (/api/auth*, JWKS, /api/auth/token). No prefix to strip.
+#
+# Why baked, not bind-mounted: a host bind-mount of a single file fails on
+# Coolify (the host source is auto-created as a DIRECTORY -> "mount a directory
+# onto a file", OCI bug — inherited LivePlace gotcha FEN-80/FEN-96). The
+# Dockerfile.proxy bakes THIS file into the image, reproducible on any host.
+#
+# SITE_ADDRESS drives scheme/port. Default ':80' = plain HTTP on :80, accepting
+# all hostnames — the reliable mode behind Coolify's edge Traefik, which
+# terminates TLS and routes the public domain to this container's internal :80
+# (so we `expose` :80, never host-publish — host-publishing breaks Coolify's
+# domain routing and 404s the public URL, FEN-92).
+{$SITE_ADDRESS::80} {
+	encode gzip zstd
+
+	# Convex client API/sync (+ the smoke's /version). Strip the /convex prefix.
+	handle_path /convex/* {
+		reverse_proxy convex-backend:3210
+	}
+
+	# Everything else -> the Start app (SPA + Better Auth). lb_try_* bridges the
+	# brief single-replica restart window during Coolify's non-zero-downtime
+	# container recreation (a sub-window blip would otherwise 503). GET-only
+	# fallback, so a retried dial has no side-effect risk.
+	reverse_proxy app:3000 {
+		lb_try_duration 3s
+		lb_try_interval 250ms
+	}
+}

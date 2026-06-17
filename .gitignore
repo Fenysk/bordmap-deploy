@@ -1,0 +1,23 @@
+node_modules
+.DS_Store
+dist
+dist-ssr
+*.local
+.env
+.nitro
+.tanstack
+.wrangler
+.output
+.vinxi
+__unconfig*
+todos.json
+
+# build & tooling
+.output
+.nitro
+coverage
+*.log
+.data/
+
+# Coolify deploy (FEN-437): secrets + assigned domain persisted here, never commit.
+infra/coolify/deploy.env

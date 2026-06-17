@@ -1,0 +1,154 @@
+# Bordmap — COOLIFY deploy compose (FEN-437, build pack = dockercompose).
+#
+# R6 RESOLUTION: the single-image co-host (app + hand-assembled Convex backend in
+# one container) failed on its first live run on Coolify — the in-image backend
+# never served (Caddy: "dial tcp …:3210/:3000 connect: connection refused"). This
+# compose uses the LOW-RISK fallback topology instead: the OFFICIAL convex-backend
+# image (binds 0.0.0.0, proven upstream + on LivePlace) as a separate service, the
+# Start app (Dockerfile.app), and a baked Caddy proxy — all on one public domain.
+#
+# Coolify routes the assigned domain to the SOLE port-exposing service (proxy:80,
+# via docker_compose_domains). Other services expose nothing (compose-network
+# reachability needs no `expose`); never host-publish (breaks Traefik routing).
+services:
+  # Official self-hosted Convex backend — unmodified, multi-arch (amd64+arm64).
+  convex-backend:
+    image: ${CONVEX_BACKEND_IMAGE:-ghcr.io/get-convex/convex-backend:aeb5f28adfe92f88c8c504b7883a12acfdf7cde6}
+    environment:
+      INSTANCE_NAME: ${CONVEX_INSTANCE_NAME:-bordmap}
+      # Stable across redeploys (generated + persisted by coolify-deploy.mjs) so
+      # the admin key / instance identity survive restarts.
+      INSTANCE_SECRET: ${CONVEX_INSTANCE_SECRET:-}
+      # Both origins MUST be valid non-empty URLs or the backend refuses to boot.
+      # We keep them at the in-container loopback defaults (the backend still binds
+      # 0.0.0.0, so Caddy reaches it on the compose network) — a public CLOUD
+      # origin with a /convex PATH or an empty SITE origin makes it exit. Browser
+      # sync/auth correctness (public origins + a /convex-site route) is a
+      # follow-up; the landing page + /version smoke work with loopback origins.
+      CONVEX_CLOUD_ORIGIN: ${CONVEX_CLOUD_ORIGIN:-http://127.0.0.1:3210}
+      CONVEX_SITE_ORIGIN: ${CONVEX_SITE_ORIGIN:-http://127.0.0.1:3211}
+      DISABLE_BEACON: 'true'
+    volumes:
+      - convex-data:/convex/data
+    healthcheck:
+      # The convex-backend image ships curl.
+      test: ['CMD', 'curl', '-f', 'http://127.0.0.1:3210/version']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # R2 routing (FEN-602): GraphHopper is now the `graphhopper` SERVICE in this
+    # compose (below), reached on the implicit `default` network by service name —
+    # the proven path convex-backend already uses for app/proxy. The old
+    # cross-resource `coolify` predefined network (original ADR D-R2) was
+    # UNREACHABLE on Coolify 4.1.2 (FEN-601). Default-only network, no coolify.
+    # Bump the label to force recreation so the network change is applied.
+    labels:
+      bordmap.network-rev: "3"
+    restart: unless-stopped
+
+  # TanStack Start (Nitro) app — app-only image, talks to convex-backend.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+      args:
+        # Baked into the client bundle: https://<domain>/convex (Caddy strips it).
+        VITE_CONVEX_URL: ${VITE_CONVEX_URL}
+    environment:
+      SITE_URL: ${SITE_URL}
+      AUTH_ISSUER: ${AUTH_ISSUER:-}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      # Where the app-entrypoint's `convex deploy` reaches the backend internally
+      # (compose network) to push schema + functions + seed on startup (FEN-444).
+      CONVEX_SELF_HOSTED_URL: http://convex-backend:3210
+      # Admin key: the app-entrypoint MINTS it offline from the instance name +
+      # secret (generate_admin_key.sh, deterministic → matches the backend), so it
+      # needs the SAME identity the backend booted with. Secret stays in the Coolify
+      # env, never the repo. CONVEX_SELF_HOSTED_ADMIN_KEY is an optional fallback.
+      CONVEX_INSTANCE_NAME: ${CONVEX_INSTANCE_NAME:-bordmap}
+      CONVEX_INSTANCE_SECRET: ${CONVEX_INSTANCE_SECRET:-}
+      CONVEX_SELF_HOSTED_ADMIN_KEY: ${CONVEX_SELF_HOSTED_ADMIN_KEY:-}
+      # R2 routing (FEN-602): the `graphhopper` service runs in THIS compose, so the
+      # app-entrypoint pushes this internal URL to the Convex env store and the
+      # computeRoutes action (FEN-504) reaches the engine server-side by service
+      # name on the default network — reliable, unlike the old separate-resource
+      # cross-network approach (original D-R2) unreachable on Coolify 4.1.2.
+      GRAPHHOPPER_URL: ${GRAPHHOPPER_URL:-http://graphhopper:8989}
+    volumes:
+      # Better Auth SQLite DB (auth.db) persists here (DATA_DIR=/app/data).
+      - app-data:/app/data
+      # Read-only Convex backend credentials — required by app-entrypoint.sh's
+      # mint_admin_key() to run generate_admin_key.sh offline (Dockerfile.app note).
+      # convex-backend writes its credentials here; app reads them to mint the key.
+      - convex-data:/convex/data:ro
+    depends_on:
+      convex-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:3000/']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # The entrypoint runs convex deploy + seed BEFORE the server binds :3000, so
+      # allow extra grace on first boot (deploy/seed can take ~30-60s on arm64).
+      start_period: 120s
+    restart: unless-stopped
+
+  # R2 routing engine (FEN-602, ADR 0002 Amendment 1). GraphHopper runs as its OWN
+  # container here — own JVM, own mem_limit, own healthcheck (D-R2's lifecycle/limit
+  # isolation) — but INSIDE the main compose, reachable as `graphhopper` on the
+  # default network (the original separate-Coolify-resource D-R2 was unreachable on
+  # 4.1.2, FEN-601). The graph cache is BAKED AT IMAGE BUILD (Dockerfile import
+  # step), so the runtime only SERVES it — no cold import, no runtime OOM. Build
+  # args pass the region + import heap cap; a build-time OOM only fails the build
+  # and leaves the live stack up. No public domain, no host port (internal only).
+  graphhopper:
+    build:
+      context: ./infra/coolify/graphhopper
+      dockerfile: Dockerfile
+      args:
+        # Region baked into the image. FEN-599: keep Rhône-Alpes; never full France
+        # on the RAM-tight NAS. Change here ⇒ rebuild bakes the new region.
+        GH_OSM_URL: ${GH_OSM_URL:-https://download.geofabrik.de/europe/france/rhone-alpes-latest.osm.pbf}
+    environment:
+      # Serve-only heap — the graph is MMAP'd from the baked cache, so 1g is ample.
+      JAVA_OPTS: ${GH_JAVA_OPTS:--Xmx1g -Xms256m}
+    # Serve-only runtime: LM graph MMAP page cache ~0.5-0.8g + 1g heap. FEN-605:
+    # LM re-enabled — bumped from 1500m to 2500m to cover the larger MMAP footprint.
+    mem_limit: 2500m
+    healthcheck:
+      # AC-as-healthcheck: run the actual completeness query (a bordmap_road route
+      # with elevation) and assert `ascend` is present — certifies routing + baked
+      # elevation end-to-end. Serve-only ⇒ ready fast (no import), short start_period.
+      test:
+        - CMD-SHELL
+        - 'curl -fsS "http://127.0.0.1:8989/route?point=45.188,5.724&point=45.196,5.735&profile=bordmap_road&elevation=true&points_encoded=false&instructions=false" | grep -q ascend'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+
+  # Baked Caddy reverse proxy — the ONLY service Coolify maps the domain to.
+  proxy:
+    build:
+      context: .
+      dockerfile: infra/coolify/Dockerfile.proxy
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    expose:
+      - '80'
+    depends_on:
+      - app
+      - convex-backend
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  convex-data:
+  app-data:
+  caddy-data:
+  caddy-config:

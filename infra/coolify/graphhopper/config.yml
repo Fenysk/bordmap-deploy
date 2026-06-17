@@ -1,0 +1,113 @@
+# GraphHopper engine config for Bordmap R2 routing (FEN-507).
+# Implements the service-facing contract in docs/adr/0002-r2-routing-engine.md.
+#
+# Pinned to the graphhopper/graphhopper:8.0 config schema (see Dockerfile). v8 is
+# chosen deliberately for reproducibility: it still supports the `vehicle: roads`
+# base in a profile + an inline custom_model, which is the simplest, best-
+# documented form. v9+ removed `vehicle:` (profiles became custom-model-only on
+# encoded values) — bumping the image REQUIRES migrating this profile block. The
+# graph IMPORT on first deploy is the verification gate (see README).
+#
+# All mutable data lives under /data (the persistent Coolify volume): the OSM
+# extract, the built graph cache, and the SRTM elevation cache. config.yml +
+# custom model are BAKED into the image (never bind-mounted — Coolify/OCI bind-
+# mount-file bug, same reason the app's Caddyfile is baked).
+graphhopper:
+  # OSM extract — FEN-602 (ADR Amendment 1): the graph is now BAKED AT IMAGE BUILD
+  # (Dockerfile wgets this PBF and runs `import`), so this is an IMAGE path under
+  # /graphhopper, NOT the /data volume — a mounted /data must never shadow the
+  # baked graph. Only read during the build `import`; the serve command ignores it.
+  # Region default Rhône-Alpes (Bordmap MVP — Grenoble/Isère); FEN-599: never
+  # restore full France on the RAM-tight NAS.
+  datareader.file: /graphhopper/osm.pbf
+
+  # REQUIRED by GraphHopper 8's `import` command (FEN-601: the build-time bake uses
+  # `import`, which — unlike `server` — hard-fails if this is absent). Skip the
+  # non-motor ways (bordmap_road is vehicle:roads, i.e. motor roads — freebord spots
+  # are referenced on roads/parking/hills, never footways/steps), which also shrinks
+  # the graph → lower import RAM/disk on the RAM-tight NAS builder.
+  import.osm.ignored_highways: footway,cycleway,path,pedestrian,steps
+
+  # Built graph cache — BAKED into the image at /graphhopper/graph-cache (NOT on a
+  # runtime volume). The serve-only runtime container memory-maps it; no import.
+  graph.location: /graphhopper/graph-cache
+
+  # MMAP caps import RAM (the graph is memory-mapped from disk, not heap-resident).
+  # Required to fit the France import under the NAS memory budget (ADR §Infra:
+  # import ~6-8 GB with RAM_STORE → MMAP keeps the JVM heap small). Trades some
+  # query latency for a much smaller footprint — acceptable for Bordmap's volume.
+  graph.dataaccess.default_type: MMAP
+
+  # Native elevation (ascend/descend) via SRTM ~30 m (board Q3 accepts "approximatif").
+  # FEN-602: SRTM is fetched during the BUILD import and BAKED at /graphhopper/srtm
+  # (image path, not /data), so the serve-only runtime has NO network dependency.
+  # If the SRTM source is unreachable at build the graph still builds and elevation
+  # degrades to null per contract.
+  graph.elevation.provider: srtm
+  graph.elevation.cache_dir: /graphhopper/srtm
+  # MMAP the elevation cache too (large rasters, read-mostly).
+  graph.elevation.dataaccess: MMAP
+
+  # Encoded values the bordmap_road custom model references (road_class /
+  # road_access / surface) plus average_slope so the response carries grade.
+  # GraphHopper 8 requires average_slope and max_slope to be enabled TOGETHER
+  # (the `import` command hard-fails otherwise) — both are derived from elevation.
+  graph.encoded_values: road_class, road_access, road_environment, surface, average_slope, max_slope, max_speed
+
+  # One profile, `bordmap_road`. Base vehicle `roads` is direction-agnostic
+  # (ignores oneway/access) so a descente can be referenced in either travel
+  # sense (ADR D-R2). The inline custom_model is the contract from the ADR:
+  # prefer paved, exclude motorway/trunk and private/no access.
+  profiles:
+    - name: bordmap_road
+      vehicle: roads
+      custom_model:
+        priority:
+          - if: "road_class == MOTORWAY || road_class == TRUNK"
+            multiply_by: "0"
+          - if: "road_access == PRIVATE || road_access == NO"
+            multiply_by: "0"
+          - if: "surface == PAVED || surface == ASPHALT || surface == CONCRETE"
+            multiply_by: "1.0"
+          - else: ""
+            multiply_by: "0.5" # unpaved/unknown allowed but de-prioritised
+
+  # Landmarks (LM) preparation enables the `alternative_route` algorithm.
+  # FEN-603 (CEO anti-loop steer 2026-06-17): DISABLED. Enabling LM has repeatedly
+  # taken GraphHopper down — build-time OOM/timeout on the RAM-tight NAS builder
+  # (FEN-599/FEN-601) and, with FEN-605's re-enable (commit 4df8b7c), a runtime that
+  # never bound :8989 (board error "graphhopper:8989 connection refused", stack
+  # running:unhealthy). Base routing (single itinerary, NO LM) is the last KNOWN-GREEN
+  # state (FEN-601 commit 30965ac "routing is green") — it gets Alexis the on-road
+  # trace, the core of the ask. Alternative itineraries are a memory-gated FOLLOW-UP
+  # (re-enable only on a host with ≥4g import headroom, or once the NAS RAM budget is
+  # resolved). DO NOT re-enable here without that headroom — that is the loop.
+  # routing.ts MUST drop the `alternative_route` algorithm param in lockstep (GH 400s
+  # "Cannot use algorithm=alternative_route without landmarks" otherwise).
+  profiles_lm: []
+
+  # No CH (see above).
+  profiles_ch: []
+
+# Dropwizard server — bind 0.0.0.0 so sibling Coolify containers (the Convex
+# backend running the computeRoutes action) reach it on the internal network.
+# This service is NEVER assigned a public domain (see docker-compose.graphhopper.yml).
+server:
+  application_connectors:
+    - type: http
+      port: 8989
+      bind_host: 0.0.0.0
+  admin_connectors:
+    - type: http
+      port: 8990
+      bind_host: 0.0.0.0
+  request_log:
+    appenders: []
+
+# Keep logs on stderr/stdout for Coolify log capture.
+logging:
+  appenders:
+    - type: console
+      time_zone: UTC
+      log_format: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{15} - %msg%n"
+  level: INFO

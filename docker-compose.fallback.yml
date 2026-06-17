@@ -1,0 +1,50 @@
+# Bordmap — DOCUMENTED FALLBACK (R6, plan §8 of FEN-341).
+#
+# Two services instead of one image, used ONLY if the single image
+# (docker-compose.yml) proves fragile on the NAS. Switching the project's
+# default to this requires board arbitration — do not flip silently.
+#
+# Run with:  docker compose -f docker-compose.fallback.yml up --build
+#
+# `convex` runs the OSS backend image unmodified (the reliable reference for
+# binary path + ports); `app` runs just the Start node server and talks to it.
+services:
+  convex:
+    # Pinned to the backend release matching `convex` npm 1.40.0 (multi-arch).
+    image: ${CONVEX_BACKEND_IMAGE:-ghcr.io/get-convex/convex-backend:aeb5f28adfe92f88c8c504b7883a12acfdf7cde6}
+    ports:
+      - '3210:3210'
+      - '3211:3211'
+    environment:
+      INSTANCE_NAME: ${CONVEX_INSTANCE_NAME:-bordmap}
+      INSTANCE_SECRET: ${CONVEX_INSTANCE_SECRET:-}
+      CONVEX_CLOUD_ORIGIN: ${CONVEX_CLOUD_ORIGIN:-http://127.0.0.1:3210}
+      CONVEX_SITE_ORIGIN: ${CONVEX_SITE_ORIGIN:-http://127.0.0.1:3211}
+      DISABLE_BEACON: 'true'
+    volumes:
+      - convex-data:/convex/data
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://127.0.0.1:3210/version']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+      args:
+        VITE_CONVEX_URL: ${VITE_CONVEX_URL:-http://localhost:3210}
+    ports:
+      - '3000:3000'
+    depends_on:
+      convex:
+        condition: service_healthy
+    environment:
+      CONVEX_SELF_HOSTED_URL: ${CONVEX_SELF_HOSTED_URL:-http://convex:3210}
+      CONVEX_SELF_HOSTED_ADMIN_KEY: ${CONVEX_SELF_HOSTED_ADMIN_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  convex-data:
