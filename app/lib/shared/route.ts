@@ -92,6 +92,29 @@ export type ComputeRoutesResult =
   | { ok: true; candidates: Array<RouteCandidate> }
   | { ok: false; error: RoutingError; message: string }
 
+// ─── Alternative itinerary contract (FEN-801 §2) ─────────────────────────────
+
+/** Opaque handle for a shown route — reused as exclude[] on next tap. Stateless: client holds geometry. */
+export interface RouteHandle {
+  handle: string
+  path: Array<LatLng>
+}
+
+/** Candidate returned by computeNextAlternative (distinct shape from RouteCandidate from computeRoutes). */
+export interface AlternativeCandidate {
+  handle: string
+  path: Array<LatLng>
+  distanceMeters: number
+  durationSeconds: number
+  ascentMeters?: number
+  overlapWithExcluded: number
+}
+
+export type NextAlternativeResult =
+  | { status: 'ok'; candidate: AlternativeCandidate }
+  | { status: 'exhausted'; reason: 'no_distinct_corridor' | 'quality_floor' }
+  | { status: 'error'; code: string; message: string }
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** GeoJSON `LineString` coordinates are [lng, lat] — note the order. */

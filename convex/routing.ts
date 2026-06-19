@@ -7,7 +7,7 @@
  */
 import { action } from './_generated/server'
 import { v } from 'convex/values'
-import type { ComputeRoutesResult } from '../app/lib/shared/route'
+import type { ComputeRoutesResult, NextAlternativeResult } from '../app/lib/shared/route'
 
 const latLng = v.object({ lat: v.number(), lng: v.number() })
 
@@ -117,5 +117,37 @@ export const computeRoutes = action({
     })
 
     return { ok: true, candidates }
+  },
+})
+
+// ─── computeNextAlternative — STUB (FEN-809 stream 3c) ───────────────────────
+// Contract: FEN-801 §2. Real implementation delivered by stream 3b.
+// Stub: returns one mock alternative (shifted path), then exhausted.
+const latLngV = v.object({ lat: v.number(), lng: v.number() })
+const routeHandleV = v.object({ handle: v.string(), path: v.array(latLngV) })
+
+export const computeNextAlternative = action({
+  args: {
+    start: latLngV,
+    end: latLngV,
+    exclude: v.array(routeHandleV),
+  },
+  handler: async (_ctx, { exclude }): Promise<NextAlternativeResult> => {
+    // STUB — to be replaced by backend stream 3b.
+    if (exclude.length === 0) return { status: 'exhausted', reason: 'no_distinct_corridor' }
+    if (exclude.length >= 2) return { status: 'exhausted', reason: 'no_distinct_corridor' }
+    const primary = exclude[0]
+    const handle = `stub-alt-${exclude.length}`
+    const path = primary.path.map((p) => ({ lat: p.lat + 0.001, lng: p.lng + 0.0015 }))
+    return {
+      status: 'ok',
+      candidate: {
+        handle,
+        path,
+        distanceMeters: Math.round(primary.path.length * 110 + 400),
+        durationSeconds: 360,
+        overlapWithExcluded: 0.25,
+      },
+    }
   },
 })

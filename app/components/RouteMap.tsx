@@ -1,7 +1,8 @@
 /**
  * Interactive map: view mode (coloured route lines) + draw mode (R2 real routing).
- * Draw flow: tap D → tap A → auto-route → alternatives → tap to select (auto-confirm) → Recommencer.
- * Via-point: tap map in selecting state → re-snap through that point (single route, no alternatives).
+ * Draw flow: tap D → tap A → auto-route → alternatives → tap to select (confirm) → Recommencer.
+ * Via-point: tap map in selecting state (no candidate hit) → re-snap through that point.
+ * "Proposer un autre itinéraire": FEN-809 AC-F1/F2/F3/F4 — accumulates candidates one at a time.
  * Client-only — MapLibre GL uses WebGL/DOM and cannot run during SSR.
  */
 import 'maplibre-gl/dist/maplibre-gl.css'
@@ -11,13 +12,26 @@ import { useAction } from 'convex/react'
 import { api as _api } from '../../convex/_generated/api'
 const api = _api as any
 import { DIFFICULTY_COLOR } from '#/lib/shared'
-import type { BoundingBox, Route, LatLng, RouteCandidate, RouteElevation } from '#/lib/shared'
+import type {
+  BoundingBox,
+  Route,
+  LatLng,
+  RouteCandidate,
+  RouteElevation,
+  RouteHandle,
+  NextAlternativeResult,
+} from '#/lib/shared'
 
-const MAX_CANDIDATES = 3
-const CAND_COLORS = ['#3b82f6', '#94a3b8', '#94a3b8'] // primary blue, others gray
+// Pool size for pre-initialised MapLibre candidate layers.
+// Must be ≥ maximum candidates that can accumulate in one session.
+const MAX_CANDIDATES = 8
+const CAND_COLORS = ['#3b82f6', '#94a3b8', '#94a3b8', '#94a3b8', '#94a3b8', '#94a3b8', '#94a3b8', '#94a3b8']
 const CAND_WIDTH_SELECTED = 6
 const CAND_WIDTH_DEFAULT = 4
 const CAND_HIT_LAYERS = Array.from({ length: MAX_CANDIDATES }, (_, i) => `cand-hit-${i}`)
+
+// D-PO-4: warn user when a recalculation is taking longer than this.
+const SLOW_THRESHOLD_MS = 5_000
 
 type DrawStep = 'idle' | 'placing-end' | 'routing' | 'selecting'
 
@@ -94,6 +108,15 @@ function fmtElevation(elev: RouteElevation | null) {
   return `D+ ${elev.gainMeters} m · D− ${elev.dropMeters} m`
 }
 
+/** Deterministic handle for a path — used as exclude[].handle (FEN-801 §2). */
+function makeRouteHandle(path: LatLng[]): string {
+  const step = Math.max(1, Math.floor(path.length / 20))
+  return path
+    .filter((_, i) => i % step === 0)
+    .map((p) => `${Math.round(p.lat * 1e5)},${Math.round(p.lng * 1e5)}`)
+    .join('|')
+}
+
 export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRouteClick }: RouteMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<any>(null)
@@ -110,14 +133,24 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
   const [startPin, setStartPin] = useState<LatLng | null>(null)
   const [endPin, setEndPin] = useState<LatLng | null>(null)
   const [candidates, setCandidates] = useState<RouteCandidate[]>([])
+  const [handles, setHandles] = useState<string[]>([])
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [routingError, setRoutingError] = useState<string | null>(null)
+  // AC-F2: loading state while computeNextAlternative runs
+  const [altLoading, setAltLoading] = useState(false)
+  // AC-F4: exhausted = no more distinct alternatives available
+  const [exhausted, setExhausted] = useState(false)
+  // AC-F3: confirmed = user selected a candidate from multi-candidate view → others dismissed
+  const [confirmed, setConfirmed] = useState(false)
+  // D-PO-4: warn when recalculation exceeds ~5 s
+  const [altSlowWarn, setAltSlowWarn] = useState(false)
 
-  // Refs for stable map event handlers
+  // Stable refs for map event handlers
   const drawStepRef = useRef<DrawStep>('idle')
   const startPinRef = useRef<LatLng | null>(null)
   const endPinRef = useRef<LatLng | null>(null)
   const candidatesRef = useRef<RouteCandidate[]>([])
+  const handlesRef = useRef<string[]>([])
   const selectedIndexRef = useRef(0)
 
   routesRef.current = routes
@@ -128,22 +161,29 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
   startPinRef.current = startPin
   endPinRef.current = endPin
   candidatesRef.current = candidates
+  handlesRef.current = handles
   selectedIndexRef.current = selectedIndex
 
   const computeRoutes = useAction(api.routing.computeRoutes)
+  const computeNextAlternative = useAction(api.routing.computeNextAlternative)
 
-  // Routing trigger — called after end pin is placed or via-point added
+  // Primary routing trigger — called after end pin placed or via-point added.
   const triggerRoutingRef = useRef<((start: LatLng, end: LatLng, via?: LatLng) => Promise<void>) | null>(null)
   triggerRoutingRef.current = async (start: LatLng, end: LatLng, via?: LatLng) => {
     setDrawStep('routing')
     setRoutingError(null)
+    setExhausted(false)
+    setConfirmed(false)
+    setAltSlowWarn(false)
     const result = await computeRoutes({ start, end, ...(via ? { via } : {}) })
     if (!result.ok) {
       setRoutingError(result.message)
       setDrawStep('placing-end')
       return
     }
+    const newHandles = result.candidates.map((c: RouteCandidate) => makeRouteHandle(c.path))
     setCandidates(result.candidates)
+    setHandles(newHandles)
     setSelectedIndex(0)
     setDrawStep('selecting')
     onGeometryRef.current?.({
@@ -154,20 +194,25 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
     })
   }
 
-  // Candidate selection — called from map click on candidate layer or overlay tap
+  // AC-F3: selecting a candidate from a multi-candidate list confirms it (dismisses others).
   const selectCandidateRef = useRef<((idx: number) => void) | null>(null)
   selectCandidateRef.current = (idx: number) => {
     const cands = candidatesRef.current
+    const hdls = handlesRef.current
     const start = startPinRef.current
     const end = endPinRef.current
     if (!cands[idx] || !start || !end) return
-    setSelectedIndex(idx)
-    onGeometryRef.current?.({
-      start,
-      end,
-      path: cands[idx].path,
-      elevation: cands[idx].elevation,
-    })
+    const chosen = cands[idx]
+    if (cands.length > 1) {
+      // AC-F3: confirm → dismiss all others
+      setCandidates([chosen])
+      setHandles([hdls[idx] ?? makeRouteHandle(chosen.path)])
+      setSelectedIndex(0)
+      setConfirmed(true)
+    } else {
+      setSelectedIndex(idx)
+    }
+    onGeometryRef.current?.({ start, end, path: chosen.path, elevation: chosen.elevation })
   }
 
   useEffect(() => setMounted(true), [])
@@ -215,10 +260,10 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
           paint: { 'line-color': ['get', 'color'], 'line-width': 4, 'line-opacity': 0.85 },
         })
 
-        // Candidate layers pool (draw mode)
+        // Pre-initialised candidate layer pool (draw mode).
+        // Pool size = MAX_CANDIDATES to support accumulation via "Proposer un autre itinéraire".
         for (let i = 0; i < MAX_CANDIDATES; i++) {
           map.addSource(`cand-${i}`, { type: 'geojson', data: emptyGeoJSON })
-          // Visible line
           map.addLayer({
             id: `cand-line-${i}`,
             type: 'line',
@@ -236,7 +281,6 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
             source: `cand-${i}`,
             paint: { 'line-color': 'rgba(0,0,0,0)', 'line-width': 20 },
           })
-          // Hover cursor
           map.on('mouseenter', `cand-hit-${i}`, () => { map.getCanvas().style.cursor = 'pointer' })
           map.on('mouseleave', `cand-hit-${i}`, () => { map.getCanvas().style.cursor = mode === 'draw' ? 'crosshair' : '' })
         }
@@ -265,12 +309,12 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
 
           map.on('click', (e: any) => {
             const step = drawStepRef.current
-            if (step === 'routing') return // ignore during routing
+            if (step === 'routing') return
 
-            // Check if click lands on a candidate hit layer
+            // Check for candidate hit layer click
             const hits = map.queryRenderedFeatures(e.point, { layers: CAND_HIT_LAYERS })
             if (hits.length > 0 && step === 'selecting') {
-              const layerId: string = hits[0].layer.id // e.g. 'cand-hit-2'
+              const layerId: string = hits[0].layer.id
               const idx = parseInt(layerId.split('-').pop()!, 10)
               selectCandidateRef.current?.(idx)
               return
@@ -280,7 +324,6 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
             const lngLat: LatLng = { lat, lng }
 
             if (step === 'idle') {
-              // Place start
               startMarkerRef.current?.remove()
               endMarkerRef.current?.remove()
               viaMarkerRef.current?.remove()
@@ -291,10 +334,12 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
               setStartPin(lngLat)
               setEndPin(null)
               setCandidates([])
+              setHandles([])
               setRoutingError(null)
+              setExhausted(false)
+              setConfirmed(false)
               setDrawStep('placing-end')
             } else if (step === 'placing-end') {
-              // Place end → auto-route
               endMarkerRef.current?.remove()
               endMarkerRef.current = new ml.Marker({ element: makeMarkerEl('A', '#dc2626') })
                 .setLngLat([lng, lat]).addTo(map)
@@ -302,7 +347,7 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
               const start = startPinRef.current
               if (start) void triggerRoutingRef.current?.(start, lngLat)
             } else if (step === 'selecting') {
-              // No candidate hit → add via-point → re-route
+              // No candidate hit → add via-point → re-route (single primary route, resets alternatives)
               viaMarkerRef.current?.remove()
               viaMarkerRef.current = new ml.Marker({ element: makeMarkerEl('V', '#7c3aed') })
                 .setLngLat([lng, lat]).addTo(map)
@@ -330,7 +375,7 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
     }
   }, [mounted, mode])
 
-  // Sync routes data when prop changes
+  // Sync existing routes data when prop changes
   useEffect(() => {
     const map = mapRef.current
     if (!map?.isStyleLoaded()) return
@@ -365,17 +410,72 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
     setStartPin(null)
     setEndPin(null)
     setCandidates([])
+    setHandles([])
     setSelectedIndex(0)
     setRoutingError(null)
+    setExhausted(false)
+    setConfirmed(false)
+    setAltLoading(false)
+    setAltSlowWarn(false)
     setDrawStep('idle')
-    // Clear candidate layers
     const map = mapRef.current
     if (map?.isStyleLoaded()) {
       for (let i = 0; i < MAX_CANDIDATES; i++) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ;(map.getSource(`cand-${i}`) as any)?.setData(emptyGeoJSON)
       }
     }
   }, [])
+
+  // AC-F2: propose a new alternative route (FEN-809).
+  const handleProposeAlternative = useCallback(async () => {
+    const start = startPinRef.current
+    const end = endPinRef.current
+    const cands = candidatesRef.current
+    const hdls = handlesRef.current
+    if (!start || !end || altLoading) return
+
+    setAltLoading(true)
+    setAltSlowWarn(false)
+    const slowTimer = setTimeout(() => setAltSlowWarn(true), SLOW_THRESHOLD_MS)
+
+    try {
+      const exclude: RouteHandle[] = cands.map((c, i) => ({
+        handle: hdls[i] ?? makeRouteHandle(c.path),
+        path: c.path,
+      }))
+      const result: NextAlternativeResult = await computeNextAlternative({ start, end, exclude })
+      clearTimeout(slowTimer)
+
+      if (result.status === 'ok') {
+        const { candidate } = result
+        const newCandidate: RouteCandidate = {
+          path: candidate.path,
+          lengthMeters: candidate.distanceMeters,
+          elevation: candidate.ascentMeters != null
+            ? { gainMeters: candidate.ascentMeters, dropMeters: 0, avgGradePct: 0 }
+            : null,
+          isPrimary: false,
+        }
+        // AC-F2: add to accumulated set, auto-select new candidate for preview
+        const newIdx = cands.length
+        setCandidates((prev) => [...prev, newCandidate])
+        setHandles((prev) => [...prev, candidate.handle])
+        setSelectedIndex(newIdx)
+        onGeometryRef.current?.({ start, end, path: newCandidate.path, elevation: newCandidate.elevation })
+      } else if (result.status === 'exhausted') {
+        setExhausted(true) // AC-F4
+      } else {
+        setRoutingError(result.message)
+      }
+    } catch (err) {
+      clearTimeout(slowTimer)
+      setRoutingError(err instanceof Error ? err.message : 'Erreur lors du calcul.')
+    } finally {
+      setAltLoading(false)
+      setAltSlowWarn(false)
+    }
+  }, [altLoading, computeNextAlternative])
 
   if (!mounted) {
     return (
@@ -386,6 +486,9 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
   }
 
   const selectedCandidate = candidates[selectedIndex] ?? null
+
+  // AC-F1: show "Proposer" button when a route is displayed and user hasn't confirmed a selection.
+  const showProposeBtn = mode === 'draw' && drawStep === 'selecting' && !confirmed
 
   return (
     <div className="relative h-full w-full">
@@ -414,10 +517,10 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
                 {fmtElevation(selectedCandidate.elevation) && (
                   <span className="text-gray-600">{fmtElevation(selectedCandidate.elevation)}</span>
                 )}
-                {candidates.length > 1 && (
+                {candidates.length > 1 && !confirmed && (
                   <span className="text-gray-500">
                     Itinéraire {selectedIndex + 1}/{candidates.length}
-                    {' '}· tap autre tracé pour changer
+                    {' '}· tap sur un tracé pour le choisir
                   </span>
                 )}
                 <button
@@ -432,9 +535,51 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
         </div>
       )}
 
-      {/* Candidate selector chips (draw mode, selecting state, >1 candidate) */}
-      {mode === 'draw' && drawStep === 'selecting' && candidates.length > 1 && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-4 flex justify-center gap-2">
+      {/* AC-F1: "Proposer un autre itinéraire" button — visible sous la carte (bottom CTA). */}
+      {showProposeBtn && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-4 flex flex-col items-center gap-2">
+          {/* AC-F4: exhausted → disabled + message "plus d'alternative" */}
+          {exhausted ? (
+            <div className="pointer-events-auto rounded-full bg-gray-100 px-4 py-2 text-xs font-medium text-gray-400 shadow" aria-live="polite">
+              Plus d'alternative disponible
+            </div>
+          ) : (
+            <button
+              className={`pointer-events-auto rounded-full px-4 py-2 text-xs font-semibold shadow transition-colors ${
+                altLoading
+                  ? 'cursor-wait bg-blue-100 text-blue-400'
+                  : 'bg-white text-blue-600 hover:bg-blue-50 active:bg-blue-100'
+              }`}
+              onClick={handleProposeAlternative}
+              disabled={altLoading}
+              aria-busy={altLoading}
+            >
+              {/* AC-F2: loading state — "Recherche…" during computeNextAlternative call */}
+              {altLoading ? (
+                <span className="flex items-center gap-1.5">
+                  <svg className="h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                  </svg>
+                  Recherche…
+                </span>
+              ) : (
+                'Proposer un autre itinéraire'
+              )}
+            </button>
+          )}
+          {/* D-PO-4: latency warning when recalculation exceeds ~5 s */}
+          {altSlowWarn && (
+            <div className="pointer-events-auto rounded bg-amber-50 border border-amber-200 px-3 py-1 text-xs text-amber-700 shadow">
+              Le calcul prend du temps — GraphHopper est plus lent sans CH.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Candidate selector chips (draw mode, selecting state, >1 candidate, not confirmed) */}
+      {mode === 'draw' && drawStep === 'selecting' && candidates.length > 1 && !confirmed && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-14 flex justify-center gap-2 px-2">
           {candidates.map((c, i) => (
             <button
               key={i}
@@ -451,7 +596,7 @@ export function RouteMap({ routes, mode, onBoundsChange, onGeometrySelect, onRou
         </div>
       )}
 
-      {/* No-route error with reposition hint (AC-6) */}
+      {/* No-route error with reposition hint */}
       {mode === 'draw' && drawStep === 'placing-end' && routingError && (
         <div className="pointer-events-none absolute inset-x-4 bottom-4">
           <div className="pointer-events-auto rounded-lg bg-red-50 border border-red-200 px-3 py-2 text-sm text-red-700 shadow">
