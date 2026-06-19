@@ -1,65 +1,53 @@
 #!/usr/bin/env bash
-# GraphHopper SERVE-ONLY entrypoint for Bordmap R2 (FEN-507, FEN-599, FEN-602).
+# GraphHopper entrypoint for Bordmap R2 (FEN-507, FEN-599, FEN-603, FEN-740).
 #
-# FEN-602 (ADR 0002 Amendment 1): the graph cache is BAKED INTO THE IMAGE at build
-# time (see Dockerfile: wget PBF + `java … import config.yml`). The runtime container
-# normally only SERVES the pre-built graph. FEN-603: a runtime import FALLBACK was
-# added below — it triggers ONLY when the baked graph is missing/empty (a silently
-# failed build bake), so the happy path is still serve-only with no cold-import RAM
-# spike; the fallback is the recovery path that keeps :8989 from going dark.
+# MODEL (FEN-740): the graph cache lives on the PERSISTENT /data Coolify volume
+# (config.yml graph.location=/data/graph-cache). On the FIRST deploy the volume is
+# empty → this script imports the regional graph ONCE (the runtime container has
+# normal egress + RAM, unlike the build-time bake which silently produced an empty
+# cache — FEN-603). Every SUBSEQUENT redeploy/recreate finds the graph already on
+# the volume and serves immediately with NO re-import (that re-import was the ~10
+# min GraphHopper outage window on each deploy — the whole point of FEN-740).
 #
-# config.yml pins graph.location to /graphhopper/graph-cache (an IMAGE path, NOT
-# the /data volume), so nothing here touches /data and no volume can shadow the
-# baked graph.
+# This replaces the FEN-602 build-bake-into-the-image design: the bake never
+# produced a usable cache, and even a working bake landed in the writable IMAGE
+# layer, which is discarded on recreate — so it re-imported every deploy anyway.
+# Importing once onto the volume is the reproducible, recreate-surviving fix.
 set -euo pipefail
 
 CONFIG="${GH_CONFIG:-/graphhopper/config.yml}"
-GRAPH_CACHE="/graphhopper/graph-cache"
+# Persistent volume path — MUST match config.yml graph.location and the
+# graphhopper-data:/data mount in docker-compose.graphhopper.yml.
+GRAPH_CACHE="/data/graph-cache"
 JAR="/graphhopper/graphhopper.jar"
 
 # Heap stays small because the graph is MMAP'd from disk (config.yml). Overridable
 # via JAVA_OPTS (compose sets it from GH_JAVA_OPTS). 1g is ample for serving a
-# regional graph's routing working set (A*/LM priority queues).
+# regional graph's routing working set (A* priority queues).
 JAVA_OPTS="${JAVA_OPTS:--Xmx1g -Xms256m}"
 
-log() { echo "[graphhopper-serve] $*" >&2; }
+log() { echo "[graphhopper] $*" >&2; }
 
-# FEN-601 diagnostic: surface the build-time bake log via the shared `diag` volume
-# (mounted at /diag-out) so it is readable at https://<host>/diag/gh-bake.log —
-# Coolify does not expose build logs over its API. Best-effort; never blocks serve.
-if [ -f /graphhopper/bake.log ]; then
-  mkdir -p /diag-out 2>/dev/null || true
-  cp -f /graphhopper/bake.log /diag-out/gh-bake.log 2>/dev/null || true
-  log "copied bake.log → /diag-out/gh-bake.log (served at /diag/gh-bake.log)"
-fi
-
-# FEN-603 (DevOps, 2026-06-17): SELF-HEALING runtime import fallback.
-# Root cause of the week-long GraphHopper outage: the build-time bake (Dockerfile
-# `import`) has been SILENTLY producing an empty graph-cache — the Dockerfile wraps
-# the import so the build ALWAYS succeeds even when the import fails (OOM or a
-# Geofabrik egress failure on the Coolify builder). With an empty cache this entry
-# point used to `exec sleep infinity`, so the container stayed "running" but NOTHING
-# listened on :8989 (board: "graphhopper:8989 connection refused", stack
-# running:unhealthy, restart_count 0 — i.e. asleep, not crash-looping). The Coolify
-# API exposes only the proxy's logs and there is no VPS shell, so the bake log was
-# unreadable. Rather than sleep forever, RECOVER: if the baked graph is missing, run
-# the import HERE (the runtime container has normal egress + RAM, unlike the builder)
-# with a capped heap (MMAP keeps the rest off-heap), then serve. Base Rhône-Alpes,
-# no LM — the proven-green workload (FEN-601). Only `sleep` (not crash-loop) if the
-# runtime import ALSO fails, so a bad state never thrashes the host.
+# One-time import. Triggers when the persistent volume has no graph yet (first
+# deploy, or after an intentional volume wipe to switch regions — FEN-599 runbook).
+# A capped heap + MMAP (config.yml) keeps the import footprint bounded under the
+# 3g mem_limit. Base Rhône-Alpes, no LM — the proven-green workload (FEN-601). Only
+# `sleep` (never crash-loop) if the import fails, so a bad state never thrashes the
+# host and the failure is diagnosable from the container's stderr/runtime-import.log.
 RUNTIME_OSM_URL="${GH_OSM_URL:-https://download.geofabrik.de/europe/france/rhone-alpes-latest.osm.pbf}"
 IMPORT_OPTS="${GH_IMPORT_OPTS:--Xmx1500m}"
+mkdir -p "$(dirname "${GRAPH_CACHE}")" 2>/dev/null || true
 if [ ! -d "${GRAPH_CACHE}" ] || [ -z "$(ls -A "${GRAPH_CACHE}" 2>/dev/null || true)" ]; then
-  log "baked graph cache missing/empty at ${GRAPH_CACHE} — build bake did not produce a graph."
-  log "RUNTIME IMPORT fallback: downloading ${RUNTIME_OSM_URL}"
+  log "no graph on the persistent volume at ${GRAPH_CACHE} — one-time import."
+  log "downloading ${RUNTIME_OSM_URL}"
   rm -rf "${GRAPH_CACHE}" 2>/dev/null || true
   if wget -q -O /graphhopper/osm.pbf "${RUNTIME_OSM_URL}"; then
     log "PBF downloaded ($(du -h /graphhopper/osm.pbf 2>/dev/null | cut -f1)); importing (opts=${IMPORT_OPTS}) …"
     if java ${IMPORT_OPTS} -jar "${JAR}" import "${CONFIG}" 2>&1 | tee /graphhopper/runtime-import.log; then
       rm -f /graphhopper/osm.pbf
-      log "runtime import OK → graph built at ${GRAPH_CACHE} ($(du -sh "${GRAPH_CACHE}" 2>/dev/null | cut -f1))"
+      log "import OK → graph built at ${GRAPH_CACHE} ($(du -sh "${GRAPH_CACHE}" 2>/dev/null | cut -f1)) — persisted on the /data volume, no re-import on redeploy."
     else
-      log "RUNTIME IMPORT FAILED — staying up (no crash-loop) for diagnosis. Tail:"
+      log "IMPORT FAILED — staying up (no crash-loop) for diagnosis. Tail:"
       tail -n 25 /graphhopper/runtime-import.log >&2 || true
       exec sleep infinity
     fi
@@ -67,9 +55,11 @@ if [ ! -d "${GRAPH_CACHE}" ] || [ -z "$(ls -A "${GRAPH_CACHE}" 2>/dev/null || tr
     log "PBF download FAILED from ${RUNTIME_OSM_URL} (egress?) — staying up for diagnosis."
     exec sleep infinity
   fi
+else
+  log "graph present on the persistent volume at ${GRAPH_CACHE} ($(du -sh "${GRAPH_CACHE}" 2>/dev/null | cut -f1)) — serving without re-import."
 fi
 
-log "serving pre-baked graph from ${GRAPH_CACHE} (config=${CONFIG}, heap=${JAVA_OPTS})"
+log "serving graph from ${GRAPH_CACHE} (config=${CONFIG}, heap=${JAVA_OPTS})"
 # GraphHopper fat-JAR "server" command loads the existing graph.location and starts
-# the Dropwizard HTTP server. No import (graph already built at image build).
+# the Dropwizard HTTP server. No import (graph already built on the volume).
 exec java ${JAVA_OPTS} -jar "${JAR}" server "${CONFIG}"

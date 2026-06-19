@@ -42,54 +42,18 @@ COPY config.yml /graphhopper/config.yml
 COPY import-and-serve.sh /graphhopper/import-and-serve.sh
 RUN chmod +x /graphhopper/import-and-serve.sh
 
-# FEN-602 (ADR Amendment 1): BAKE the graph cache AT BUILD so the runtime container
-# only SERVES (no cold import → no runtime OOM that took down the live NAS stack in
-# FEN-601; a build-time OOM only fails the build and Coolify keeps the old stack up).
-# Region is a build ARG (default Rhône-Alpes — FEN-599: never full France on the NAS).
-# Heap is CAPPED and graph.dataaccess=MMAP (config.yml) so the import footprint stays
-# bounded; SRTM elevation is fetched here too and baked at /graphhopper/srtm. All
-# outputs land on IMAGE paths under /graphhopper (config.yml), never /data, so no
-# runtime volume can shadow them.
-ARG GH_OSM_URL=https://download.geofabrik.de/europe/france/rhone-alpes-latest.osm.pbf
-# Import heap is HARDCODED to 1g in the RUN below (Coolify did not honor the
-# build-arg — it ran -Xmx2g — and the NAS builder is RAM-tight). 1g matches what
-# the prior GH import used successfully; MMAP keeps the rest off-heap.
-# Download the regional PBF, build the graph cache with a CAPPED heap + MMAP, then
-# drop the PBF (only the import needs it — the serve command loads graph-cache and
-# ignores datareader.file). No mid-RUN comments: a `#` line inside a `\`-continued
-# RUN is a Dockerfile parse gotcha.
-# FEN-601 diagnostic: capture the WHOLE bake to /graphhopper/bake.log and let the
-# RUN always succeed (no set -e on the outer shell), so the image always builds
-# even when the import fails. The serve entrypoint copies bake.log to the shared
-# `diag` volume → readable at /diag/gh-bake.log (Coolify build logs are not exposed
-# via the API). Revert to fail-fast once the import is proven.
-# FEN-605: BuildKit cache mount for the PBF download. On cache miss the PBF is
-# downloaded from Geofabrik and stored in the BuildKit cache volume (persists across
-# deploys on the same builder). On cache hit the copy is near-instant, making LM
-# rebuilds feasible within Coolify's build timeout.
-RUN --mount=type=cache,target=/pbf-cache,id=gh-pbf-cache,sharing=locked \
-  set -ux; mem=$( (free -m 2>/dev/null || true) ); \
-  ( set -eux; \
-    echo "host mem at build start:"; echo "${mem}"; \
-    CACHE_PBF="/pbf-cache/osm.pbf"; \
-    if [ -f "${CACHE_PBF}" ]; then \
-      echo "PBF cache hit — copying from ${CACHE_PBF}"; \
-      cp "${CACHE_PBF}" /graphhopper/osm.pbf; \
-    else \
-      echo "PBF cache miss — downloading from ${GH_OSM_URL}"; \
-      wget -q -O "${CACHE_PBF}.tmp" "${GH_OSM_URL}"; \
-      mv "${CACHE_PBF}.tmp" "${CACHE_PBF}"; \
-      cp "${CACHE_PBF}" /graphhopper/osm.pbf; \
-    fi; \
-    du -h /graphhopper/osm.pbf; \
-    java -Xmx2g -jar /graphhopper/graphhopper.jar import /graphhopper/config.yml; \
-    du -sh /graphhopper/graph-cache; \
-    rm -f /graphhopper/osm.pbf; \
-    echo "BAKE_OK" \
-  ) > /graphhopper/bake.log 2>&1; echo "BAKE_EXIT=$?" >> /graphhopper/bake.log; \
-  tail -n 30 /graphhopper/bake.log
+# FEN-740: NO build-time graph bake. The earlier FEN-602 "bake at build" design
+# (a wrapped `java import` in this Dockerfile) silently produced an EMPTY graph
+# cache on the Coolify builder (build-time OOM / Geofabrik egress) and, even when
+# it built, landed the cache in the writable IMAGE layer — discarded on every
+# recreate, so the runtime re-imported on each redeploy anyway (~10 min outage
+# window). The graph is now imported ONCE by import-and-serve.sh onto the
+# PERSISTENT /data volume (config.yml graph.location=/data/graph-cache), where it
+# survives redeploys. The build is therefore fast and deterministic: JAR + config
+# + entrypoint only, no network-heavy import that can fail the image build.
 
 EXPOSE 8989
 
-# Serve-only at runtime (graph already baked above).
+# Import-once-then-serve. First deploy imports the regional graph onto /data and
+# serves; subsequent deploys find it on the volume and serve immediately.
 ENTRYPOINT ["/graphhopper/import-and-serve.sh"]

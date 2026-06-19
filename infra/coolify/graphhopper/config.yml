@@ -8,29 +8,32 @@
 # encoded values) — bumping the image REQUIRES migrating this profile block. The
 # graph IMPORT on first deploy is the verification gate (see README).
 #
-# All mutable data lives under /data (the persistent Coolify volume): the OSM
-# extract, the built graph cache, and the SRTM elevation cache. config.yml +
-# custom model are BAKED into the image (never bind-mounted — Coolify/OCI bind-
-# mount-file bug, same reason the app's Caddyfile is baked).
+# FEN-740: the built graph cache + SRTM elevation cache live on the PERSISTENT
+# /data Coolify volume so the (proven-green) runtime import runs ONCE and SURVIVES
+# a redeploy/recreate — eliminating the ~10 min re-import on every deploy that the
+# old build-bake-into-the-image-layer design caused (the writable image layer is
+# discarded on recreate; FEN-603). The transient OSM extract is downloaded by the
+# entrypoint to an image path and deleted after import. config.yml + custom model
+# are BAKED into the image (never bind-mounted — Coolify/OCI bind-mount-file bug,
+# same reason the app's Caddyfile is baked).
 graphhopper:
-  # OSM extract — FEN-602 (ADR Amendment 1): the graph is now BAKED AT IMAGE BUILD
-  # (Dockerfile wgets this PBF and runs `import`), so this is an IMAGE path under
-  # /graphhopper, NOT the /data volume — a mounted /data must never shadow the
-  # baked graph. Only read during the build `import`; the serve command ignores it.
+  # OSM extract — TRANSIENT. import-and-serve.sh downloads the regional PBF here,
+  # runs `import`, then deletes it (only the import reads it; serve ignores it).
   # Region default Rhône-Alpes (Bordmap MVP — Grenoble/Isère); FEN-599: never
-  # restore full France on the RAM-tight NAS.
+  # restore full France on a RAM-tight host.
   datareader.file: /graphhopper/osm.pbf
 
-  # REQUIRED by GraphHopper 8's `import` command (FEN-601: the build-time bake uses
-  # `import`, which — unlike `server` — hard-fails if this is absent). Skip the
-  # non-motor ways (bordmap_road is vehicle:roads, i.e. motor roads — freebord spots
-  # are referenced on roads/parking/hills, never footways/steps), which also shrinks
-  # the graph → lower import RAM/disk on the RAM-tight NAS builder.
+  # REQUIRED by GraphHopper 8's `import` command (it — unlike `server` — hard-fails
+  # if this is absent). Skip the non-motor ways (bordmap_road is vehicle:roads, i.e.
+  # motor roads — freebord spots are referenced on roads/parking/hills, never
+  # footways/steps), which also shrinks the graph → lower import RAM/disk.
   import.osm.ignored_highways: footway,cycleway,path,pedestrian,steps
 
-  # Built graph cache — BAKED into the image at /graphhopper/graph-cache (NOT on a
-  # runtime volume). The serve-only runtime container memory-maps it; no import.
-  graph.location: /graphhopper/graph-cache
+  # Built graph cache — on the PERSISTENT /data volume (FEN-740). The runtime
+  # imports it once (import-and-serve.sh) then memory-maps it; a subsequent
+  # redeploy finds it already present on the volume and serves immediately with NO
+  # re-import. The volume mount is /data (docker-compose.graphhopper.yml).
+  graph.location: /data/graph-cache
 
   # MMAP caps import RAM (the graph is memory-mapped from disk, not heap-resident).
   # Required to fit the France import under the NAS memory budget (ADR §Infra:
@@ -39,12 +42,12 @@ graphhopper:
   graph.dataaccess.default_type: MMAP
 
   # Native elevation (ascend/descend) via SRTM ~30 m (board Q3 accepts "approximatif").
-  # FEN-602: SRTM is fetched during the BUILD import and BAKED at /graphhopper/srtm
-  # (image path, not /data), so the serve-only runtime has NO network dependency.
-  # If the SRTM source is unreachable at build the graph still builds and elevation
-  # degrades to null per contract.
+  # FEN-740: SRTM tiles are cached on the PERSISTENT /data volume so the one-time
+  # import does not re-fetch them on a later re-import, and the served graph has no
+  # runtime network dependency. If the SRTM source is unreachable during the import
+  # the graph still builds and elevation degrades to null per contract.
   graph.elevation.provider: srtm
-  graph.elevation.cache_dir: /graphhopper/srtm
+  graph.elevation.cache_dir: /data/srtm
   # MMAP the elevation cache too (large rasters, read-mostly).
   graph.elevation.dataaccess: MMAP
 

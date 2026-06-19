@@ -9,10 +9,25 @@ Unblocks the routing executor [FEN-504](/FEN/issues/FEN-504).
 
 | File | Role |
 |---|---|
-| `Dockerfile` | builds on official `graphhopper/graphhopper:8.0` (multi-arch), bakes config + entrypoint |
-| `config.yml` | engine config: `bordmap_road` profile, inline custom model, SRTM elevation, MMAP |
-| `import-and-serve.sh` | downloads the France PBF to the volume once, then import-or-serve |
-| `docker-compose.graphhopper.yml` | the standalone Coolify resource (own 4 GB limit, ≥20 GB volume, no public domain) |
+| `Dockerfile` | builds GraphHopper 8.0 from the release JAR (multi-arch), bakes config + entrypoint. **No build-time graph bake** (FEN-740) |
+| `config.yml` | engine config: `bordmap_road` profile, inline custom model, SRTM elevation, MMAP. `graph.location` + SRTM cache on the **persistent `/data` volume** |
+| `import-and-serve.sh` | imports the regional graph onto `/data` **once**, then serves; later redeploys serve the persisted graph with no re-import |
+| `docker-compose.graphhopper.yml` | the standalone Coolify resource (`mem_limit: 3g`, persistent `graphhopper-data` volume, no public domain) |
+
+## Graph persistence model (FEN-740)
+
+The graph cache lives on the **persistent `graphhopper-data` volume** (`/data/graph-cache`),
+not in the image. On the **first** deploy `import-and-serve.sh` downloads the regional
+PBF and runs the import once (a few minutes for Rhône-Alpes), writing the graph onto the
+volume. **Every subsequent redeploy/recreate** finds the graph already on the volume and
+**serves immediately — no re-import**. This replaced the FEN-602 "bake at build" design,
+which silently produced an empty cache and (even when it worked) landed it in the
+writable image layer that a recreate discards, forcing a ~10 min re-import on every deploy.
+
+**Switching region (FEN-599):** changing `GH_OSM_URL` does **not** auto-rebuild — the
+volume already holds the old region's graph. To switch, **wipe the `graphhopper-data`
+volume** (or its `/data/graph-cache` + `/data/srtm` dirs) and redeploy; the next boot
+re-imports the new region once.
 
 The app/Convex side (`GRAPHHOPPER_URL`) is wired in `docker-compose.coolify.yml`,
 `docker/app-entrypoint.sh`, and `.env.example` — inert until FEN-504 ships the
@@ -50,10 +65,10 @@ GraphHopper is its **own** resource in the Bordmap Coolify project
    Bordmap app resource). That puts both on the shared `coolify` bridge network so
    the app/convex-backend resolve `bordmap-graphhopper` by name. **Do NOT** assign a
    public domain — this service stays internal.
-4. **Deploy.** The first deploy downloads the ~4.5 GB France PBF and runs the graph
-   import — expect **30–90 min** on a NAS (healthcheck `start_period` is 5400 s to
-   cover it). The graph cache persists on the `graphhopper-data` volume, so restarts
-   only serve (fast, no re-import).
+4. **Deploy.** The first deploy downloads the regional PBF (Rhône-Alpes ~0.4 GB,
+   FEN-599) and runs the graph import once — a few minutes (healthcheck `start_period`
+   is 1800 s to cover it). The graph persists on the `graphhopper-data` volume, so
+   **every later redeploy serves immediately with no re-import** (FEN-740).
 
 ### First-import RAM
 
@@ -70,8 +85,10 @@ container, or a one-off on the host attached to the `coolify` network):
 
 ```sh
 # Two French points (Grenoble area) — expect snapped geometry + ascend/descend.
+# Base routing, single itinerary (LM/alternative_route abandoned per board Option A,
+# FEN-739); on-demand alternatives are a separate follow-up (FEN-800).
 curl -s "http://bordmap-graphhopper:8989/route?point=45.188,5.724&point=45.196,5.735\
-&profile=bordmap_road&algorithm=alternative_route&alternative_route.max_paths=3\
+&profile=bordmap_road\
 &elevation=true&points_encoded=false&instructions=false" | head -c 600
 ```
 
