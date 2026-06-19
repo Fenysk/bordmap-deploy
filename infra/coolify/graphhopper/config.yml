@@ -92,6 +92,21 @@ graphhopper:
   # No CH (see above).
   profiles_ch: []
 
+  # FEN-807 / FEN-800 (AC-G1) — allow per-request `ch.disable=true`. This is a
+  # PURE CONFIG FLAG: it adds NO preparation, NO graph, NO import → ZERO RAM cost
+  # (mem_limit stays 3g, see docker-compose.graphhopper.yml). It is REQUIRED so the
+  # "autre itinéraire à la demande" backend (FEN-802 computeNextAlternative) can
+  # send flexible requests carrying a request-time `custom_model` (area-avoidance,
+  # `areas` GeoJSON) to force a DISTINCT corridor — WITHOUT any LM. GraphHopper
+  # rejects any request with `ch.disable=true` ("Disabling CH not allowed on the
+  # server-side") unless this is true — and that check fires on the REQUEST PARAM
+  # regardless of whether CH is prepared, so it is needed even though profiles_ch
+  # is empty. Request-time custom_model needs NO extra flag: it is accepted on any
+  # FLEXIBLE profile (no CH), which bordmap_road already is. There is NO real
+  # `custom_models.enabled` GraphHopper key — that part of the contract = "flexible
+  # profile accepted", which is satisfied here. See POC: docs/poc/fen807-graphhopper-flex.md.
+  routing.ch.disabling_allowed: true
+
 # Dropwizard server — bind 0.0.0.0 so sibling Coolify containers (the Convex
 # backend running the computeRoutes action) reach it on the internal network.
 # This service is NEVER assigned a public domain (see docker-compose.graphhopper.yml).
