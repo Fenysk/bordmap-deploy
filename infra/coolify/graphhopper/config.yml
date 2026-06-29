@@ -1,0 +1,202 @@
+# GraphHopper engine config for Bordmap R2 routing (FEN-507).
+# Implements the service-facing contract in docs/adr/0002-r2-routing-engine.md.
+#
+# Pinned to the graphhopper/graphhopper:8.0 config schema (see Dockerfile). v8 is
+# chosen deliberately for reproducibility: it still supports the `vehicle: roads`
+# base in a profile + an inline custom_model, which is the simplest, best-
+# documented form. v9+ removed `vehicle:` (profiles became custom-model-only on
+# encoded values) — bumping the image REQUIRES migrating this profile block. The
+# graph IMPORT on first deploy is the verification gate (see README).
+#
+# FEN-740: the graph cache + SRTM elevation cache live on the PERSISTENT /data
+# volume (graphhopper-data, mounted in docker-compose.coolify.yml). import-and-
+# serve.sh IMPORTS ONCE onto /data on the first boot of a fresh volume, then SERVES
+# it on every boot — the volume survives container recreate, so a redeploy no longer
+# re-imports (~10 min outage was per-recreate before). config.yml + custom model are
+# BAKED into the image (never bind-mounted — Coolify/OCI bind-mount-file bug, same
+# reason the app's Caddyfile is baked).
+graphhopper:
+  # OSM extract — transient: import-and-serve.sh downloads the regional PBF here for
+  # the one-time import, then deletes it (only `import` reads it; `server` ignores
+  # it). Region default Rhône-Alpes (Bordmap MVP — Grenoble/Isère); FEN-599: never
+  # restore full France on the RAM-tight NAS.
+  datareader.file: /graphhopper/osm.pbf
+
+  # REQUIRED by GraphHopper 8's `import` command (FEN-601: the build-time bake uses
+  # `import`, which — unlike `server` — hard-fails if this is absent).
+  #
+  # FEN-1310 (ADR 0003, CEO-approved 2026-06-29): un-ignore the RIDEABLE pedestrian
+  # classes so Freebord can route over montées/footways/pedestrian streets/open
+  # traboules (the Vieux-Lyon core — Montée du Gourguillon, Place de la Trinité, Rue
+  # Tramassac… are all `highway=pedestrian` and were silently dropped here, so a `via`
+  # posed on them snapped ~50-89 m away to the nearest motor road). The `roads` base
+  # vehicle is access/oneway-agnostic, so once imported it traverses them — the ONLY
+  # blocker was this import filter. We keep ONLY `steps` excluded: real escaliers are
+  # never rideable (Alexis's "sans escalier" rule), and excluding them at IMPORT (not
+  # in the custom_model) keeps ZERO startup-compile/boot-kill surface (cf. the slope
+  # saga FEN-826/955/958). Trade-off: the graph grows (denser urban footway mesh) →
+  # higher import RAM — this REQUIRES a re-import on a WIPED graphhopper-data volume
+  # (a warm volume never re-imports, FEN-740) and was RAM-gated on TEST first (FEN-1310
+  # S1). Was: footway,cycleway,path,pedestrian,steps.
+  import.osm.ignored_highways: steps
+
+  # Built graph cache — PERSISTED on the /data volume (FEN-740). Imported once, then
+  # memory-mapped on every serve boot; survives container recreate ⇒ no re-import.
+  graph.location: /data/graph-cache
+
+  # MMAP caps import RAM (the graph is memory-mapped from disk, not heap-resident).
+  # Required to fit the France import under the NAS memory budget (ADR §Infra:
+  # import ~6-8 GB with RAM_STORE → MMAP keeps the JVM heap small). Trades some
+  # query latency for a much smaller footprint — acceptable for Bordmap's volume.
+  graph.dataaccess.default_type: MMAP
+
+  # Native elevation (ascend/descend) via SRTM ~30 m (board Q3 accepts "approximatif").
+  # FEN-740: SRTM tiles are fetched during the one-time runtime import and PERSISTED
+  # at /data/srtm, so subsequent serve boots have NO network dependency. If the SRTM
+  # source is unreachable during that import the graph still builds and elevation
+  # degrades to null per contract.
+  graph.elevation.provider: srtm
+  graph.elevation.cache_dir: /data/srtm
+  # MMAP the elevation cache too (large rasters, read-mostly).
+  graph.elevation.dataaccess: MMAP
+
+  # Encoded values the bordmap_road custom model references (road_class /
+  # road_access / surface) plus average_slope so the response carries grade.
+  # GraphHopper 8 requires average_slope and max_slope to be enabled TOGETHER
+  # (the `import` command hard-fails otherwise) — both are derived from elevation.
+  graph.encoded_values: road_class, road_access, road_environment, surface, average_slope, max_slope, max_speed
+
+  # One profile, `bordmap_road`. Base vehicle `roads` is direction-agnostic
+  # (ignores oneway/access) so a descente can be referenced in either travel
+  # sense (ADR D-R2). The inline custom_model is the proven boot-safe contract:
+  # prefer paved, exclude motorway/trunk and private/no access.
+  #
+  # FEN-955 (DEPLOY INCIDENT 2026-06-21): the FEN-952 slope-based custom_model
+  # (max_slope > 8 hard-exclude + progressive penalty) was deployed at HEAD
+  # e0f5c53 and GraphHopper NEVER bound :8989 — the whole compose went
+  # exited:unhealthy ("Application is not running"), same boot-kill class as
+  # FEN-826. GH compiles profile custom_models at SERVER STARTUP, so a model
+  # that fails there crashes GH before it serves. Rolled back to this proven
+  # boot-safe block to RESTORE service; the slope/AC-7 enhancement must be
+  # re-landed in a boot-verified way (must prove GH stays running:healthy and
+  # routing.computeRoutes ok:true live, not just "build finished").
+  # Lockstep with convex/routing.ts (S2): profile name `bordmap_road` is frozen,
+  # and NO ch.*/disabling_allowed/CH/LM flag may be added (boot-kill FEN-826).
+  profiles:
+    - name: bordmap_road
+      vehicle: roads
+      custom_model:
+        priority:
+          - if: "road_class == MOTORWAY || road_class == TRUNK"
+            multiply_by: "0"
+          # FEN-1315 / FEN-1310 AC-4 (DevOps S4 pre-deploy verification, 2026-06-29):
+          # the Vieux-Lyon montées (Montée du Gourguillon, OSM way 1233389877) carry
+          # `motor_vehicle=permit`, which GH8 maps to road_access=PRIVATE. The bare
+          # `road_access == PRIVATE || NO -> 0` exclusion (meant to keep routes off
+          # genuinely private/no-access motor roads) therefore HARD-EXCLUDED the exact
+          # pedestrian streets Freebord wants. Proven on the re-imported Rhône-Alpes
+          # graph: with the bare rule the route DETOURS ~268 m (road_access=PRIVATE edge
+          # gets priority 0; `0 × 1.0 = 0`, so the pedestrian else_if below cannot rescue
+          # it); exempting PEDESTRIAN/FOOTWAY makes the route take the Gourguillon 41.9 m
+          # direct on the FULL profile (surface 0.5 in force), GH boots healthy (the
+          # `&&`/`!=` expression compiles at startup — boot-verified, not just built).
+          # This — not the import fix or the surface parity else_if — is what actually
+          # satisfies AC-4 (the earlier 41.9 m "proof" was measured on a permissive
+          # profile that had dropped this access rule entirely). Foot access is unaffected
+          # by motor_vehicle=permit, so pedestrian/footway stay rideable; the surface 0.5
+          # penalty still de-prioritises rough ways.
+          - if: "(road_access == PRIVATE || road_access == NO) && road_class != PEDESTRIAN && road_class != FOOTWAY"
+            multiply_by: "0"
+          # FEN-958 (DEPLOY INCIDENT 2026-06-21): the slope custom_model was rolled
+          # back AGAIN to restore service. BOTH `max_slope` (FEN-952/FEN-955) and
+          # `average_slope` (commit 90a7382, deployed as 826c2ee, build "finished"
+          # 19:29 → app 503 "no available server") boot-kill GH: the server fails to
+          # COMPILE the profile custom_model at startup, never binds :8989, the whole
+          # compose goes 503 (same class as FEN-826). The slope EVs are queryable as
+          # path-DETAILS (computed from stored elevation at query time, FEN-955 measured
+          # 31%) but are NOT usable in a custom-model expression against THIS persisted
+          # /data graph — the warm graph-cache was imported without slope as a stored
+          # custom-model encoded value, and FEN-740 never re-imports on a warm volume.
+          # Re-landing AC-7 slope exclusion therefore requires a graph RE-IMPORT (wipe
+          # the graph-cache so the new encoded_values actually index slope), a heavier
+          # RAM-gated change — tracked on FEN-958, NOT a config-only redeploy. DO NOT
+          # re-add a slope `if` here without a re-import + boot-verified deploy: loop.
+          - if: "surface == PAVED || surface == ASPHALT || surface == CONCRETE"
+            multiply_by: "1.0"
+          # FEN-1315 / FEN-1310 AC-4 (2026-06-29): keep PEDESTRIAN/FOOTWAY at paved
+          # PARITY (1.0) instead of letting cobbled montées fall to the `else: 0.5`
+          # unpaved penalty. PARITY INSURANCE — not the deciding fix.
+          # What actually fixes AC-4 is the IMPORT change (import.osm.ignored_highways:
+          # steps, ADR 0003): it puts the Vieux-Lyon montées into the graph. FEN
+          # measured live on the re-imported TEST graph (gh-gourguillon-route-proof.sh,
+          # GH gc_perm): with this profile's surface penalty in force, the route ALREADY
+          # takes the Montée du Gourguillon (OSM way 1233389877, highway=pedestrian,
+          # surface=unhewn_cobblestone) — 41.9 m direct on the pedestrian edge, and the
+          # top->bottom bracket descends it (173 m, no U-turn). Excluding pedestrian
+          # (priority 0) is what forces the ~267 m car detour. The surface 0.5 penalty is
+          # NOT decisive because the `roads` vehicle uses a high flat speed (this profile
+          # adds no custom_model SPEED rule, so maxspeed=10 is NOT applied), so distance
+          # dominates and the short montée wins even at 0.5. (This corrects the earlier
+          # maxspeed=10 cost model.) The else_if is cheap insurance for denser spots
+          # where 0.5 could lose, and to make "pedestrian ways are rideable, not unpaved"
+          # explicit for Freebord.
+          # Form: `else_if 1.0`, NOT a standalone `if PEDESTRIAN multiply_by 2` — the
+          # latter pushes a PAVED pedestrian way to 2.0 (>1), outside the [0,1] band GH
+          # normalises priority against, on the startup-compile path that boot-killed GH
+          # twice (FEN-826/955/958). else_if keeps EVERY class <=1. The expression
+          # compiles + routes correctly at query time (same compiler as the profile) =>
+          # boot-safe. CAVEAT: GH bakes the profile custom_model into a hash stored WITH
+          # the graph; changing it makes GH refuse a warm graph ("Profiles do not match")
+          # => this is NOT restart-only, it needs a (re)import. That's free here: FEN-1317
+          # wipes the volume and re-imports prod anyway, baking this rule then.
+          - else_if: "road_class == PEDESTRIAN || road_class == FOOTWAY"
+            multiply_by: "1.0"
+          - else: ""
+            multiply_by: "0.5" # unpaved/unknown allowed but de-prioritised
+
+  # Landmarks (LM) preparation enables the `alternative_route` algorithm.
+  # FEN-603 (CEO anti-loop steer 2026-06-17): DISABLED. Enabling LM has repeatedly
+  # taken GraphHopper down — build-time OOM/timeout on the RAM-tight NAS builder
+  # (FEN-599/FEN-601) and, with FEN-605's re-enable (commit 4df8b7c), a runtime that
+  # never bound :8989 (board error "graphhopper:8989 connection refused", stack
+  # running:unhealthy). Base routing (single itinerary, NO LM) is the last KNOWN-GREEN
+  # state (FEN-601 commit 30965ac "routing is green") — it gets Alexis the on-road
+  # trace, the core of the ask. Alternative itineraries are a memory-gated FOLLOW-UP
+  # (re-enable only on a host with ≥4g import headroom, or once the NAS RAM budget is
+  # resolved). DO NOT re-enable here without that headroom — that is the loop.
+  # routing.ts MUST drop the `alternative_route` algorithm param in lockstep (GH 400s
+  # "Cannot use algorithm=alternative_route without landmarks" otherwise).
+  profiles_lm: []
+
+  # FEN-826 (PROD INCIDENT 2026-06-19): routing.ch.disabling_allowed:true (added in
+  # FEN-807 commit 316529a) took the stack down — main compose went exited:unhealthy,
+  # GraphHopper refused :8989 on both hostnames, pose A/B broke on bordmap.fenysk.fr.
+  # ROLLED BACK to base known-green to restore service first. The flex path
+  # (computeNextAlternative, FEN-800/808) must be re-instructed on a deploy that is
+  # smoke-verified GREEN before re-adding any ch.* flag — re-enabling it blind is the loop.
+
+  # No CH (see above).
+  profiles_ch: []
+
+# Dropwizard server — bind 0.0.0.0 so sibling Coolify containers (the Convex
+# backend running the computeRoutes action) reach it on the internal network.
+# This service is NEVER assigned a public domain (see docker-compose.graphhopper.yml).
+server:
+  application_connectors:
+    - type: http
+      port: 8989
+      bind_host: 0.0.0.0
+  admin_connectors:
+    - type: http
+      port: 8990
+      bind_host: 0.0.0.0
+  request_log:
+    appenders: []
+
+# Keep logs on stderr/stdout for Coolify log capture.
+logging:
+  appenders:
+    - type: console
+      time_zone: UTC
+      log_format: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{15} - %msg%n"
+  level: INFO

@@ -1,0 +1,36 @@
+# Bordmap — PRIMARY: single image (CEO directive "le tout dans un Docker").
+# `docker compose up --build` brings up the whole stack (Convex backend + Start
+# app) in ONE container. TLS/reverse proxy is terminated by the NAS in front
+# (see README §NAS) — not modelled here.
+services:
+  bordmap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # PUBLIC origin the browser uses to reach Convex. For a plain local run
+        # this is the host's Convex port; on the NAS use the proxied https URL.
+        VITE_CONVEX_URL: ${VITE_CONVEX_URL:-http://localhost:3210}
+        # Backend image pin (defaults to the version matching `convex` npm in the
+        # Dockerfile ARG). Override here to bump in lockstep with the npm pkg.
+        CONVEX_BACKEND_IMAGE: ${CONVEX_BACKEND_IMAGE:-ghcr.io/get-convex/convex-backend:aeb5f28adfe92f88c8c504b7883a12acfdf7cde6}
+    ports:
+      - '3000:3000' # Start app (put the reverse proxy in front of this)
+      - '3210:3210' # Convex API origin
+      - '3211:3211' # Convex HTTP actions / site origin
+    environment:
+      # Generated/derived inside the container if absent (stable across restarts
+      # via the persisted instance credentials). Set a stable one in prod
+      # (Docker secret / .env) to be explicit.
+      CONVEX_SELF_HOSTED_ADMIN_KEY: ${CONVEX_SELF_HOSTED_ADMIN_KEY:-}
+      # PUBLIC origins the browser/CLI use to reach Convex. Locally the loopback
+      # defaults apply; on the NAS set these to the proxied https origins.
+      CONVEX_CLOUD_ORIGIN: ${CONVEX_CLOUD_ORIGIN:-}
+      CONVEX_SITE_ORIGIN: ${CONVEX_SITE_ORIGIN:-}
+      DISABLE_BEACON: ${DISABLE_BEACON:-true}
+    volumes:
+      - convex-data:/convex/data
+    restart: unless-stopped
+
+volumes:
+  convex-data:

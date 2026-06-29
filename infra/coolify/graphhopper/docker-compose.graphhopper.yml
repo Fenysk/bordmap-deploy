@@ -1,0 +1,88 @@
+# Bordmap R2 — GraphHopper routing engine as a SEPARATE Coolify resource (FEN-507).
+#
+# ADR D-R2: GraphHopper runs as its OWN container, NOT bundled into the app image
+# — different runtime (JVM), a multi-GB memory profile, and a heavy one-time graph
+# import that must not share the app's lifecycle or limits. Deploy this as a
+# DISTINCT Coolify "Docker Compose" resource in the Bordmap project (build pack =
+# dockercompose, base directory = repo root, compose location =
+# /infra/coolify/graphhopper/docker-compose.graphhopper.yml).
+#
+# NETWORK: this service is NEVER assigned a public domain — it is reachable ONLY
+# on the internal Coolify network. To let the Bordmap app's convex-backend
+# (which runs the computeRoutes action, ADR D-R3) reach it by name, enable
+# Coolify's "Connect To Predefined Network" toggle on BOTH this resource AND the
+# Bordmap app resource. Both then share the `coolify` bridge network and resolve
+# each other by container_name. The Convex action then uses:
+#     GRAPHHOPPER_URL = http://bordmap-graphhopper:8989
+services:
+  graphhopper:
+    container_name: bordmap-graphhopper
+    build:
+      # Context = THIS directory (compose-file-relative). config.yml +
+      # import-and-serve.sh live here, so the Dockerfile COPYs them by local name.
+      # A `../../..` repo-root context made COPY paths escape the resolved build
+      # context and the Coolify dockercompose build pack rejected it right after
+      # the JAR step (FEN-507) — keep the context tight to this dir.
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Heap stays small because the graph is MMAP'd from disk (config.yml). Leaves
+      # headroom under the cgroup limit for mmap page cache + GC.
+      # import-and-serve.sh reads JAVA_OPTS. 1g max / 256m initial is ample for a
+      # regional graph's routing working set (priority queues, A*, LM).
+      JAVA_OPTS: ${GH_JAVA_OPTS:--Xmx1g -Xms256m}
+      # OSM source/region. FEN-599: defaults to Rhône-Alpes (the Bordmap MVP area —
+      # Grenoble/Isère). The full France extract (~4.5 GB) OOM-killed the JVM on the
+      # shared NAS even at mem_limit 5g (FEN-519 recurrence); a regional extract
+      # (~0.4 GB) keeps the MMAP page-cache footprint ~10x smaller and stable.
+      # import-and-serve.sh re-imports automatically when this URL changes. To grow
+      # coverage later, point this at a larger Geofabrik extract and bump mem_limit.
+      GH_OSM_URL: ${GH_OSM_URL:-https://download.geofabrik.de/europe/france/rhone-alpes-latest.osm.pbf}
+    volumes:
+      # Persistent: OSM extract (~4.5 GB) + built graph cache (~3-5 GB) + SRTM
+      # cache (~1-2 GB). Host must provide >= 20 GB free on this volume's disk
+      # (ADR §Infra). Named volume → survives redeploys, so the heavy import runs
+      # ONCE and restarts serve from cache.
+      - graphhopper-data:/data
+    # RUNTIME memory cap. FEN-599: a regional (Rhône-Alpes) graph's MMAP page cache
+    # is ~0.3-0.5g, so JVM heap 1g + ~0.5g overhead + cache fits comfortably under
+    # 3g — and frees ~2g on the shared NAS vs the old 5g France cap that still
+    # OOM-looped. If you switch GH_OSM_URL back to full France, raise this to >=6g.
+    mem_limit: 3g
+    healthcheck:
+      # AC-as-healthcheck (FEN-507 completeness criterion). This service is
+      # internal-only (no public domain) and this Coolify version (4.1.2) exposes
+      # no command-exec API and a broken per-app logs endpoint — so the ONLY
+      # reliable signal we can read back is the container's health STATUS. We make
+      # that status MEAN the AC: the healthcheck runs the actual completeness
+      # query — a bordmap_road route between two French points with elevation — and
+      # asserts the response carries `ascend` (proves the route computes for the
+      # profile AND elevation is baked into the graph). `running:healthy` therefore
+      # certifies the AC end-to-end. It is also a strictly better production
+      # readiness probe than a bare /health ping. Elevation is baked at import time,
+      # so this query is deterministic with no runtime network dependency.
+      # During the one-time regional import the server is not yet bound, so
+      # start_period stays generous (FEN-599: Rhône-Alpes imports in minutes, but
+      # keep 30 min headroom for a cold SRTM elevation + LM build). curl + grep are
+      # in the image.
+      test:
+        - CMD-SHELL
+        - 'curl -fsS "http://127.0.0.1:8989/route?point=45.188,5.724&point=45.196,5.735&profile=bordmap_road&elevation=true&points_encoded=false&instructions=false" | grep -q ascend'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1800s
+    restart: unless-stopped
+    networks:
+      - coolify
+
+volumes:
+  graphhopper-data:
+
+# `coolify` is Coolify's predefined shared bridge network. Marked external so this
+# compose joins it rather than creating an isolated one — that is what makes
+# bordmap-graphhopper resolvable from the app/convex-backend containers. Requires
+# the "Connect To Predefined Network" toggle ON for this resource in Coolify.
+networks:
+  coolify:
+    external: true
